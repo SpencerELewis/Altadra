@@ -1,0 +1,1 @@
+Altadra is intended to become a 2d video game engine.
