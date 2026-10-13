@@ -1,0 +1,5 @@
+/target/
+/dist/
+/.vs/
+**/bin/
+**/obj/
