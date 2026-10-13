@@ -34,8 +34,10 @@ subsystem, so it does not open an extra console window.
 ## Editor
 
 - The app opens to **Home**. Name a project and select **Create project** to open
-  an unsaved, empty project; choosing a save location up front is optional. Save
-  from the editor toolbar, or choose **Save** when exiting to choose a location.
+  an unsaved, empty project; choosing a save location up front is optional. The
+  first save (from the toolbar or when exiting) opens a **Save project** dialog:
+  enter the project name and choose a location, and Altadra creates the project
+  folder `<location>\<name>` inside it.
 - **Open / import project** selects an existing folder containing `scene.json`
   and its `assets` folder. This opens projects in place without changing or
   copying their existing data.
@@ -45,11 +47,20 @@ subsystem, so it does not open an extra console window.
 - **Home** in the editor returns to the project picker; unsaved changes require
   confirmation. Exiting an unsaved project or a project with recent edits asks
   whether to save, discard, or cancel. Existing projects save to their current
-  folder; new projects use the chosen parent folder and project name.
+  folder; new projects open the Save project dialog.
 - New projects contain no sample sprites or assets. Add sprites from the Scene
   tab, and import PNG assets from files anywhere on your computer.
 - The editor's left dock opens to the **Project** tab, which shows the active
-  project's folder tree. Switch to **Scene** for the sprite hierarchy and controls.
+  project's folder tree. Create files and folders, rename or delete selected
+  entries, and click UTF-8 text files to edit them. Text edits are limited to
+  1 MB and save from the file editor or project Save button. Unsaved projects
+  keep files in a temporary workspace and copy them into the chosen project
+  folder when saved. `scene.json` remains managed by the scene editor; binary
+  assets can be imported from anywhere. Use the **+** menu or right-click the
+  project root, a folder, or a file to create items; right-click also provides
+  rename and delete actions. Select a file or folder and press **Delete** to
+  remove it (with confirmation). Selected sprites have a bright outline in the
+  viewport. Switch to **Scene** for the sprite hierarchy and controls.
 - Edit name, position, rotation, scale, size, tint, visibility, velocity, and each
   sprite's Lua script in the inspector.
 - Click sprites to select them in the viewport. Rotation and scale are used for
@@ -57,8 +68,10 @@ subsystem, so it does not open an extra console window.
   +Y is down; the last sprite draws on top.
 - Import PNG files. Images are copied into the project on save. They can be tinted
   in the inspector. Without an imported image, sprites render as solid-color quads.
-- New, Open, Save, and Save As operate on project directories. Unsaved changes and
-  overwriting another project's scene require confirmation.
+- New, Open, Save, and Save As operate on project directories. Save As uses the
+  same Save project dialog: the chosen folder is the location, and a new project
+  folder with the given name is created inside it (existing folders are never
+  overwritten). Unsaved changes require confirmation.
 - Play runs a fixed 60 Hz clone of the authoring scene. Click the viewport and use
   WASD or arrow keys; Stop discards runtime changes and preserves the authored scene.
 - Script/runtime, file, and image errors are shown in the editor status area.

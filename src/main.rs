@@ -4,6 +4,7 @@
 )]
 
 mod project;
+mod project_files;
 mod recent;
 mod runtime;
 mod scene;
@@ -38,8 +39,14 @@ struct Altadra {
     recent_error: Option<String>,
     project_name: String,
     projects_parent: Option<PathBuf>,
+    file_workspace: Option<tempfile::TempDir>,
     left_panel_tab: LeftPanelTab,
     selected_file: Option<PathBuf>,
+    open_text_file: Option<PathBuf>,
+    text_buffer: String,
+    text_file_dirty: bool,
+    file_dialog: Option<FileDialogState>,
+    save_dialog: Option<SaveProjectDialog>,
     selected: Option<String>,
     runtime: Option<Runtime>,
     textures: std::collections::HashMap<String, egui::TextureHandle>,
@@ -70,8 +77,14 @@ impl Altadra {
             recent_error,
             project_name: "My 2D Game".into(),
             projects_parent: None,
+            file_workspace: None,
             left_panel_tab: LeftPanelTab::Project,
             selected_file: None,
+            open_text_file: None,
+            text_buffer: String::new(),
+            text_file_dirty: false,
+            file_dialog: None,
+            save_dialog: None,
             selected,
             runtime: None,
             textures: Default::default(),
@@ -102,32 +115,138 @@ impl Altadra {
         }
     }
 
-    fn new_project_directory(&mut self) -> Option<PathBuf> {
-        if let Err(error) = project::validate_project_name(&self.project_name) {
-            self.error = Some(error);
-            return None;
+    fn begin_save_project_dialog(&mut self, close_after_save: bool) {
+        let name = self
+            .project
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.project_name.clone());
+        let location = self
+            .project
+            .path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| self.projects_parent.clone());
+        self.save_dialog = Some(SaveProjectDialog {
+            name,
+            location,
+            close_after_save,
+            error: None,
+        });
+    }
+
+    fn save_project_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.save_dialog.as_mut() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut browse = false;
+        egui::Window::new("Save project")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label("Project name");
+                let response = ui.text_edit_singleline(&mut dialog.name);
+                if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    confirm = true;
+                }
+                ui.add_space(6.0);
+                ui.label("Location");
+                ui.horizontal(|ui| {
+                    match &dialog.location {
+                        Some(location) => ui.monospace(location.display().to_string()),
+                        None => ui.weak("No location chosen"),
+                    };
+                    if ui.button("Browse...").clicked() {
+                        browse = true;
+                    }
+                });
+                if let Some(location) = &dialog.location {
+                    ui.add_space(6.0);
+                    ui.weak(format!(
+                        "Project folder: {}",
+                        location.join(dialog.name.trim()).display()
+                    ));
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if browse {
+            let mut picker =
+                rfd::FileDialog::new().set_title("Choose where to create the project folder");
+            if let Some(location) = &dialog.location {
+                picker = picker.set_directory(location);
+            }
+            if let Some(location) = picker.pick_folder() {
+                dialog.location = Some(location);
+                dialog.error = None;
+            }
         }
-        let parent = self.projects_parent.clone().or_else(|| {
-            rfd::FileDialog::new()
-                .set_title("Choose a location for your new project")
-                .pick_folder()
-        })?;
-        self.projects_parent = Some(parent.clone());
-        let directory = parent.join(self.project_name.trim());
-        if directory.exists() {
-            self.error = Some(format!(
-                "'{}' already exists. Choose another name or open the existing project.",
-                directory.display()
-            ));
-            return None;
+        if cancel {
+            self.save_dialog = None;
+            return;
         }
-        Some(directory)
+        if !confirm {
+            return;
+        }
+        let Some(location) = dialog.location.clone() else {
+            dialog.error = Some("Choose a location for the project folder.".into());
+            return;
+        };
+        let directory = match project_directory_in(&location, &dialog.name) {
+            Ok(directory) => directory,
+            Err(error) => {
+                dialog.error = Some(error);
+                return;
+            }
+        };
+        let close_after_save = dialog.close_after_save;
+        let name = dialog.name.trim().to_owned();
+        match self.save_to(directory) {
+            Ok(()) => {
+                self.save_dialog = None;
+                self.error = None;
+                self.project_name = name;
+                self.projects_parent = Some(location);
+                if close_after_save {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            Err(error) => {
+                self.status = error.clone();
+                if let Some(dialog) = self.save_dialog.as_mut() {
+                    dialog.error = Some(error);
+                }
+            }
+        }
     }
 
     fn activate_project(&mut self, project: Project, ctx: &egui::Context) {
         self.project = project;
+        self.file_workspace = None;
         self.left_panel_tab = LeftPanelTab::Project;
-        self.selected_file = None;
+        self.selected_file = self.project.path.clone();
+        self.open_text_file = None;
+        self.text_buffer.clear();
+        self.text_file_dirty = false;
+        self.file_dialog = None;
+        self.save_dialog = None;
         self.selected = self
             .project
             .scene
@@ -150,9 +269,30 @@ impl Altadra {
             self.error = Some(error);
             return;
         }
+        let workspace = match tempfile::Builder::new()
+            .prefix("altadra-unsaved-")
+            .tempdir()
+        {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                self.error = Some(format!(
+                    "Could not create an unsaved project workspace: {error}"
+                ));
+                return;
+            }
+        };
         self.activate_project(new_project(), ctx);
+        self.selected_file = Some(workspace.path().to_path_buf());
+        self.file_workspace = Some(workspace);
         self.dirty = true;
         self.status = "New project is empty and unsaved. Add content, then save it from the toolbar or when exiting.".into();
+    }
+
+    fn file_root_path(&self) -> Option<&std::path::Path> {
+        self.file_workspace
+            .as_ref()
+            .map(tempfile::TempDir::path)
+            .or(self.project.path.as_deref())
     }
 
     fn open_project(&mut self, path: &std::path::Path, ctx: &egui::Context) {
@@ -171,6 +311,12 @@ impl Altadra {
         }
         self.dirty = false;
         self.runtime = None;
+        self.file_workspace = None;
+        self.selected_file = None;
+        self.open_text_file = None;
+        self.text_buffer.clear();
+        self.text_file_dirty = false;
+        self.save_dialog = None;
         self.page = AppPage::Home;
         self.error = None;
         self.status = "Choose a project to get started.".into();
@@ -349,10 +495,10 @@ impl Altadra {
     }
 
     fn confirm_discard(&self) -> bool {
-        !self.dirty
+        !(self.dirty || self.text_file_dirty)
             || rfd::MessageDialog::new()
                 .set_title("Unsaved changes")
-                .set_description("Discard unsaved scene and script changes?")
+                .set_description("Discard unsaved project and file changes?")
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::YesNo)
                 .show()
@@ -361,7 +507,7 @@ impl Altadra {
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if self.page != AppPage::Editor
-            || !(self.dirty || self.project.path.is_none())
+            || !(self.dirty || self.text_file_dirty || self.project.path.is_none())
             || !ctx.input(|input| input.viewport().close_requested())
         {
             return;
@@ -381,24 +527,11 @@ impl Altadra {
 
         match choice {
             rfd::MessageDialogResult::Yes => {
-                let directory = if let Some(path) = self.project.path.clone() {
-                    Some(path)
-                } else {
-                    self.new_project_directory()
-                };
-
-                let Some(directory) = directory else {
+                let Some(directory) = self.project.path.clone() else {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.begin_save_project_dialog(true);
                     return;
                 };
-                if self.project.path.is_none() && directory.exists() {
-                    self.error = Some(format!(
-                        "'{}' already exists. Choose a different project name or save location.",
-                        directory.display()
-                    ));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    return;
-                }
                 if let Err(error) = self.save_to(directory) {
                     self.error = Some(error.clone());
                     self.status = error;
@@ -431,11 +564,398 @@ impl Altadra {
     }
 
     fn save_to(&mut self, directory: std::path::PathBuf) -> Result<(), String> {
+        self.save_open_text_file()?;
+        let previous_path = self.project.path.clone();
+        let workspace_path = self
+            .file_workspace
+            .as_ref()
+            .map(|workspace| workspace.path().to_path_buf());
         self.project.save(&directory).map_err(|e| e.to_string())?;
+        let saved_root = self
+            .project
+            .path
+            .clone()
+            .ok_or_else(|| "Saved project folder was not recorded.".to_owned())?;
+        if let Some(workspace_path) = workspace_path {
+            project_files::copy_workspace_files(&workspace_path, &saved_root)?;
+            if let Some(open_file) = self.open_text_file.as_mut()
+                && let Ok(relative) = open_file.strip_prefix(&workspace_path)
+            {
+                *open_file = saved_root.join(relative);
+            }
+            if let Some(selected) = self.selected_file.as_mut()
+                && let Ok(relative) = selected.strip_prefix(&workspace_path)
+            {
+                *selected = saved_root.join(relative);
+            }
+            self.file_workspace = None;
+        } else if let Some(previous_path) = previous_path
+            && previous_path != saved_root
+        {
+            if let Err(error) = project_files::copy_workspace_files(&previous_path, &saved_root) {
+                self.project.path = Some(previous_path);
+                return Err(error);
+            }
+            self.open_text_file = None;
+            self.text_buffer.clear();
+            self.text_file_dirty = false;
+        }
+        self.selected_file = self.project.path.clone();
         self.dirty = false;
         self.status = format!("Saved {}", directory.display());
         self.remember_project(&directory);
         Ok(())
+    }
+
+    fn save_open_text_file(&mut self) -> Result<(), String> {
+        if !self.text_file_dirty {
+            return Ok(());
+        }
+        if self.runtime.is_some() {
+            return Err("Stop play mode before saving project files.".into());
+        }
+        let root = self
+            .file_root_path()
+            .ok_or_else(|| "Save the project before editing project files.".to_owned())?;
+        let file = self
+            .open_text_file
+            .as_deref()
+            .ok_or_else(|| "No text file is open.".to_owned())?;
+        project_files::write_text_file(root, file, &self.text_buffer)?;
+        self.text_file_dirty = false;
+        self.status = format!("Saved {}", file.display());
+        self.error = None;
+        Ok(())
+    }
+
+    fn open_project_file(&mut self, path: PathBuf) {
+        if self.runtime.is_some() {
+            self.status = "Stop play mode before opening project files.".into();
+            return;
+        }
+        if self.open_text_file.as_ref() == Some(&path) {
+            return;
+        }
+        if self.text_file_dirty {
+            let choice = rfd::MessageDialog::new()
+                .set_title("Unsaved file changes")
+                .set_description("Save changes to the open file before switching?")
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::YesNoCancel)
+                .show();
+            match choice {
+                rfd::MessageDialogResult::Yes => {
+                    if let Err(error) = self.save_open_text_file() {
+                        self.error = Some(error.clone());
+                        self.status = error;
+                        return;
+                    }
+                }
+                rfd::MessageDialogResult::No => {}
+                _ => return,
+            }
+        }
+        self.selected_file = Some(path.clone());
+        let Some(root) = self.file_root_path() else {
+            self.status = "Save the project before opening its files.".into();
+            return;
+        };
+        match project_files::read_text_file(root, &path) {
+            Ok(contents) => {
+                self.open_text_file = Some(path.clone());
+                self.text_buffer = contents;
+                self.text_file_dirty = false;
+                self.error = None;
+                self.status = format!("Editing {}", path.display());
+            }
+            Err(error) => {
+                self.open_text_file = None;
+                self.text_buffer.clear();
+                self.text_file_dirty = false;
+                self.status = error;
+                self.error = None;
+            }
+        }
+    }
+
+    fn begin_file_dialog(&mut self, action: project_files::EntryAction) {
+        let Some(root) = self.file_root_path() else {
+            return;
+        };
+        let target = self
+            .selected_file
+            .as_deref()
+            .filter(|selected| selected.is_dir())
+            .or_else(|| {
+                self.selected_file
+                    .as_deref()
+                    .and_then(std::path::Path::parent)
+            })
+            .unwrap_or(root)
+            .to_path_buf();
+        let (name, target) = if action == project_files::EntryAction::Rename {
+            let Some(selected) = self
+                .selected_file
+                .as_deref()
+                .filter(|selected| *selected != root)
+            else {
+                return;
+            };
+            let Some(name) = selected.file_name() else {
+                return;
+            };
+            if selected == root.join("assets") {
+                self.error = Some("The assets folder cannot be renamed.".into());
+                return;
+            }
+            (name.to_string_lossy().into_owned(), selected.to_path_buf())
+        } else {
+            (String::new(), target)
+        };
+        self.file_dialog = Some(FileDialogState {
+            action,
+            target,
+            name,
+        });
+    }
+
+    fn apply_file_dialog(&mut self, dialog: FileDialogState, ctx: &egui::Context) {
+        if self.runtime.is_some() {
+            self.error = Some("Stop play mode before changing project files.".into());
+            self.file_dialog = Some(dialog);
+            return;
+        }
+        let Some(root) = self.file_root_path().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let result = match dialog.action {
+            project_files::EntryAction::NewFile => {
+                project_files::create_file(&root, &dialog.target, &dialog.name)
+            }
+            project_files::EntryAction::NewFolder => {
+                project_files::create_folder(&root, &dialog.target, &dialog.name)
+            }
+            project_files::EntryAction::Rename => {
+                let old_path = dialog.target.clone();
+                let asset_rename = asset_name_for_path(&root, &old_path)
+                    .filter(|name| self.project.assets.contains_key(name))
+                    .map(|old_name| {
+                        let new_name = format!("assets/{}", dialog.name);
+                        (old_name, new_name)
+                    });
+                if let Some((_, new_name)) = &asset_rename
+                    && let Err(error) = project::validate_asset_name(new_name)
+                {
+                    self.error = Some(error);
+                    self.file_dialog = Some(dialog);
+                    return;
+                }
+                match project_files::rename_entry(&root, &dialog.target, &dialog.name) {
+                    Ok(new_path) => {
+                        if self.selected_file.as_deref().is_some_and(|selected| {
+                            selected == old_path || selected.starts_with(&old_path)
+                        }) {
+                            self.selected_file = Some(new_path.clone());
+                        }
+                        if let Some(open_file) = self.open_text_file.as_mut()
+                            && let Ok(relative) = open_file.strip_prefix(&old_path)
+                        {
+                            *open_file = new_path.join(relative);
+                        }
+                        if let Some((old_name, new_name)) = asset_rename
+                            && let Some(bytes) = self.project.assets.remove(&old_name)
+                        {
+                            for sprite in &mut self.project.scene.sprites {
+                                if sprite.asset.as_deref() == Some(&old_name) {
+                                    sprite.asset = Some(new_name.clone());
+                                }
+                            }
+                            self.project.assets.insert(new_name, bytes);
+                            self.dirty = true;
+                            self.refresh_textures(ctx);
+                        }
+                        Ok(new_path)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        match result {
+            Ok(path) => {
+                self.selected_file = Some(path.clone());
+                self.error = None;
+                if dialog.action == project_files::EntryAction::NewFile {
+                    self.open_project_file(path);
+                } else {
+                    self.status = format!("Updated {}", path.display());
+                }
+            }
+            Err(error) => {
+                self.error = Some(error);
+                self.file_dialog = Some(dialog);
+            }
+        }
+    }
+
+    fn delete_selected_entry(&mut self) {
+        if self.runtime.is_some() {
+            self.error = Some("Stop play mode before changing project files.".into());
+            return;
+        }
+        let (Some(root), Some(entry)) = (
+            self.file_root_path().map(std::path::Path::to_path_buf),
+            self.selected_file.clone(),
+        ) else {
+            return;
+        };
+        if entry == root {
+            self.error = Some("The project folder itself cannot be removed.".into());
+            return;
+        }
+        let is_directory = entry.is_dir();
+        let description = if is_directory {
+            format!(
+                "Remove '{}' and everything inside it?",
+                entry.file_name().unwrap_or_default().to_string_lossy()
+            )
+        } else {
+            format!(
+                "Remove '{}'?",
+                entry.file_name().unwrap_or_default().to_string_lossy()
+            )
+        };
+        if rfd::MessageDialog::new()
+            .set_title("Delete project item")
+            .set_description(description)
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::YesNo)
+            .show()
+            != rfd::MessageDialogResult::Yes
+        {
+            return;
+        }
+        if self.text_file_dirty
+            && self
+                .open_text_file
+                .as_deref()
+                .is_some_and(|file| file == entry || file.starts_with(&entry))
+        {
+            let choice = rfd::MessageDialog::new()
+                .set_title("Unsaved file changes")
+                .set_description("Save changes to this file before deleting it?")
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::YesNoCancel)
+                .show();
+            match choice {
+                rfd::MessageDialogResult::Yes => {
+                    if let Err(error) = self.save_open_text_file() {
+                        self.error = Some(error);
+                        return;
+                    }
+                }
+                rfd::MessageDialogResult::No => {}
+                _ => return,
+            }
+        }
+        let removed_assets = self
+            .project
+            .assets
+            .keys()
+            .filter(|name| root.join(name).strip_prefix(&entry).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        match project_files::delete_entry(&root, &entry) {
+            Ok(()) => {
+                for asset in removed_assets {
+                    self.project.assets.remove(&asset);
+                    for sprite in &mut self.project.scene.sprites {
+                        if sprite.asset.as_deref() == Some(&asset) {
+                            sprite.asset = None;
+                        }
+                    }
+                    self.dirty = true;
+                }
+                if self
+                    .open_text_file
+                    .as_deref()
+                    .is_some_and(|file| file == entry || file.starts_with(&entry))
+                {
+                    self.open_text_file = None;
+                    self.text_buffer.clear();
+                    self.text_file_dirty = false;
+                }
+                self.selected_file = Some(root);
+                self.status = format!("Removed {}", entry.display());
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn handle_project_delete_key(&mut self, ctx: &egui::Context) {
+        let should_delete = self.page == AppPage::Editor
+            && self.left_panel_tab == LeftPanelTab::Project
+            && self.runtime.is_none()
+            && self.file_dialog.is_none()
+            && self.save_dialog.is_none()
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|input| input.key_pressed(egui::Key::Delete));
+        if should_delete {
+            self.delete_selected_entry();
+        }
+    }
+
+    fn handle_tree_action(&mut self, action: TreeAction, path: PathBuf) {
+        self.selected_file = Some(path);
+        match action {
+            TreeAction::NewFile => self.begin_file_dialog(project_files::EntryAction::NewFile),
+            TreeAction::NewFolder => self.begin_file_dialog(project_files::EntryAction::NewFolder),
+            TreeAction::Rename => self.begin_file_dialog(project_files::EntryAction::Rename),
+            TreeAction::Delete => self.delete_selected_entry(),
+        }
+    }
+
+    fn file_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.file_dialog.as_mut() else {
+            return;
+        };
+        let title = match dialog.action {
+            project_files::EntryAction::NewFile => "New file",
+            project_files::EntryAction::NewFolder => "New folder",
+            project_files::EntryAction::Rename => "Rename",
+        };
+        let mut result = None;
+        let mut cancel = false;
+        let confirm_label = if dialog.action == project_files::EntryAction::Rename {
+            "Rename"
+        } else {
+            "Create"
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("In: {}", dialog.target.display()));
+                let response = ui.text_edit_singleline(&mut dialog.name);
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) && response.has_focus() {
+                    result = Some(());
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(confirm_label).clicked() {
+                        result = Some(());
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if let Some(()) = result {
+            if let Some(dialog) = self.file_dialog.take() {
+                self.apply_file_dialog(dialog, ctx);
+            }
+        } else if cancel {
+            self.file_dialog = None;
+        }
     }
 
     fn file_action(&mut self, action: FileAction, ctx: &egui::Context) {
@@ -458,35 +978,13 @@ impl Altadra {
                     self.open_project(&directory, ctx);
                 }
             }
-            FileAction::Save | FileAction::SaveAs => {
-                let directory = if action == FileAction::Save {
-                    if self.project.path.is_some() {
-                        self.project.path.clone()
-                    } else {
-                        self.new_project_directory()
-                    }
-                } else {
-                    rfd::FileDialog::new()
-                        .set_title("Choose a folder for the Altadra project")
-                        .pick_folder()
-                };
-                if let Some(directory) = directory {
-                    if directory.join("scene.json").exists()
-                        && self.project.path.as_ref() != Some(&directory)
-                        && rfd::MessageDialog::new()
-                            .set_title("Overwrite project")
-                            .set_description("Replace the scene in this project folder?")
-                            .set_level(rfd::MessageLevel::Warning)
-                            .set_buttons(rfd::MessageButtons::YesNo)
-                            .show()
-                            != rfd::MessageDialogResult::Yes
-                    {
-                        return;
-                    }
+            FileAction::Save | FileAction::SaveAs => match self.project.path.clone() {
+                Some(directory) if action == FileAction::Save => {
                     let result = self.save_to(directory);
                     self.report(result);
                 }
-            }
+                _ => self.begin_save_project_dialog(false),
+            },
             FileAction::Import => {
                 if let Some(file) = rfd::FileDialog::new()
                     .add_filter("PNG image", &["png"])
@@ -495,7 +993,12 @@ impl Altadra {
                     match std::fs::read(&file)
                         .map_err(|e| e.to_string())
                         .and_then(|bytes| {
-                            self.project.import_png(&bytes).map_err(|e| e.to_string())
+                            let name =
+                                self.project.import_png(&bytes).map_err(|e| e.to_string())?;
+                            if let Some(workspace) = &self.file_workspace {
+                                project_files::stage_asset_file(workspace.path(), &name, &bytes)?;
+                            }
+                            Ok(name)
                         }) {
                         Ok(name) => {
                             if let Some(sprite) = self.selected_sprite_mut() {
@@ -595,7 +1098,11 @@ impl Altadra {
                     self.status = "Stopped. Authoring scene and saved state are unchanged.".into();
                     self.error = None;
                 }
-                ui.label(if self.dirty { "● Unsaved changes" } else { "Saved" });
+                ui.label(if self.dirty || self.text_file_dirty {
+                    "● Unsaved changes"
+                } else {
+                    "Saved"
+                });
             });
         });
     }
@@ -623,37 +1130,101 @@ impl Altadra {
 
                 match self.left_panel_tab {
                     LeftPanelTab::Project => {
-                        if let Some(root) = self.project.path.as_deref() {
-                            let root_name = root
-                                .file_name()
-                                .unwrap_or(root.as_os_str())
-                                .to_string_lossy()
-                                .into_owned();
+                        if let Some(root) = self.file_root_path().map(PathBuf::from) {
+                            let root_name = if self.project.path.is_none() {
+                                format!("{} (unsaved)", self.project_name.trim())
+                            } else {
+                                root.file_name()
+                                    .unwrap_or(root.as_os_str())
+                                    .to_string_lossy()
+                                    .into_owned()
+                            };
                             ui.label(egui::RichText::new(&root_name).strong())
                                 .on_hover_text(root.display().to_string());
+                            let mut create_file = false;
+                            let mut create_folder = false;
+                            let mut context_action = None;
+                            ui.horizontal_wrapped(|ui| {
+                                ui.menu_button("+  ▾", |ui| {
+                                    if ui.button("New File").clicked() {
+                                        create_file = true;
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("New Folder").clicked() {
+                                        create_folder = true;
+                                        ui.close_menu();
+                                    }
+                                });
+                            });
+                            if create_file {
+                                self.begin_file_dialog(project_files::EntryAction::NewFile);
+                            } else if create_folder {
+                                self.begin_file_dialog(project_files::EntryAction::NewFolder);
+                            }
                             ui.separator();
 
                             let mut errors = Vec::new();
+                            let mut clicked_file = None;
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                egui::CollapsingHeader::new(format!("📁 {root_name}"))
-                                    .id_salt(root)
-                                    .default_open(true)
-                                    .show(ui, |ui| {
+                                let (_, header_label, _) =
+                                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                                        ui.ctx(),
+                                        ui.make_persistent_id(&root),
+                                        true,
+                                    )
+                                    .show_header(ui, |ui| {
+                                        let response = ui.selectable_label(
+                                            self.selected_file.as_ref() == Some(&root),
+                                            format!("📁 {root_name}"),
+                                        );
+                                        if response.clicked() {
+                                            self.selected_file = Some(root.clone());
+                                        }
+                                        response
+                                    })
+                                    .body(|ui| {
                                         render_project_tree(
                                             ui,
-                                            root,
+                                            &root,
                                             &mut self.selected_file,
+                                            &mut clicked_file,
+                                            &mut context_action,
                                             &mut errors,
                                         );
                                     });
+                                response_context_menu(
+                                    &header_label.inner,
+                                    &root,
+                                    true,
+                                    &mut context_action,
+                                );
+                                let blank_space = ui.allocate_response(
+                                    Vec2::new(
+                                        ui.available_width(),
+                                        (ui.available_height() - 48.0).max(24.0),
+                                    ),
+                                    egui::Sense::click(),
+                                );
+                                response_context_menu(
+                                    &blank_space,
+                                    &root,
+                                    true,
+                                    &mut context_action,
+                                );
                             });
+                            if let Some((action, path)) = context_action {
+                                self.handle_tree_action(action, path);
+                            }
+                            if let Some(path) = clicked_file {
+                                self.open_project_file(path);
+                            }
                             for error in errors {
                                 ui.colored_label(Color32::LIGHT_RED, error);
                             }
                             if let Some(path) = &self.selected_file {
                                 ui.separator();
                                 ui.label(
-                                    path.strip_prefix(root)
+                                    path.strip_prefix(&root)
                                         .unwrap_or(path)
                                         .display()
                                         .to_string(),
@@ -661,7 +1232,7 @@ impl Altadra {
                                 .on_hover_text(path.display().to_string());
                             }
                         } else {
-                            ui.label("Unsaved project — no files saved yet.");
+                            ui.label("Create a project to manage its files.");
                         }
                     }
                     LeftPanelTab::Scene => {
@@ -703,6 +1274,69 @@ impl Altadra {
                     }
                 }
             });
+    }
+
+    fn text_editor(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.open_text_file.clone() else {
+            return;
+        };
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let display_path = self
+                    .file_root_path()
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(&path);
+                ui.heading(display_path.display().to_string());
+                if self.text_file_dirty {
+                    ui.label(egui::RichText::new("● Unsaved").color(Color32::YELLOW));
+                }
+                if ui
+                    .add_enabled(self.text_file_dirty, egui::Button::new("Save file"))
+                    .clicked()
+                    && let Err(error) = self.save_open_text_file()
+                {
+                    self.error = Some(error);
+                }
+                if ui.button("Close file").clicked() {
+                    self.close_open_text_file();
+                }
+            });
+            ui.separator();
+            let response = ui.add(
+                egui::TextEdit::multiline(&mut self.text_buffer)
+                    .code_editor()
+                    .desired_width(f32::INFINITY)
+                    .desired_rows(24),
+            );
+            if response.changed() {
+                self.text_file_dirty = true;
+                self.error = None;
+            }
+        });
+    }
+
+    fn close_open_text_file(&mut self) {
+        if self.text_file_dirty {
+            let choice = rfd::MessageDialog::new()
+                .set_title("Unsaved file changes")
+                .set_description("Save changes to this file before closing it?")
+                .set_level(rfd::MessageLevel::Warning)
+                .set_buttons(rfd::MessageButtons::YesNoCancel)
+                .show();
+            match choice {
+                rfd::MessageDialogResult::Yes => {
+                    if let Err(error) = self.save_open_text_file() {
+                        self.error = Some(error);
+                        return;
+                    }
+                }
+                rfd::MessageDialogResult::No => {}
+                _ => return,
+            }
+        }
+        self.open_text_file = None;
+        self.text_buffer.clear();
+        self.text_file_dirty = false;
     }
 
     fn inspector(&mut self, ctx: &egui::Context) {
@@ -914,7 +1548,13 @@ impl Altadra {
                     for i in 0..4 {
                         painter.line_segment(
                             [corners[i], corners[(i + 1) % 4]],
-                            Stroke::new(2.0_f32, Color32::WHITE),
+                            Stroke::new(5.0_f32, Color32::from_rgb(8, 12, 18)),
+                        );
+                    }
+                    for i in 0..4 {
+                        painter.line_segment(
+                            [corners[i], corners[(i + 1) % 4]],
+                            Stroke::new(2.5_f32, Color32::from_rgb(80, 205, 255)),
                         );
                     }
                 }
@@ -960,6 +1600,7 @@ fn rotated_corners(center: Pos2, size: Vec2, angle: f32) -> [Pos2; 4] {
 impl eframe::App for Altadra {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
+        self.handle_project_delete_key(ctx);
         if self.page == AppPage::Editor {
             self.update_play(ctx);
         }
@@ -972,7 +1613,13 @@ impl eframe::App for Altadra {
                 self.top_bar(ctx);
                 self.left_panel(ctx);
                 self.inspector(ctx);
-                self.viewport(ctx);
+                if self.open_text_file.is_some() {
+                    self.text_editor(ctx);
+                } else {
+                    self.viewport(ctx);
+                }
+                self.file_dialog_window(ctx);
+                self.save_project_dialog_window(ctx);
                 egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                     if let Some(error) = &self.error {
                         ui.colored_label(Color32::LIGHT_RED, error);
@@ -1001,6 +1648,8 @@ fn render_project_tree(
     ui: &mut egui::Ui,
     directory: &std::path::Path,
     selected_file: &mut Option<PathBuf>,
+    clicked_file: &mut Option<PathBuf>,
+    context_action: &mut Option<(TreeAction, PathBuf)>,
     errors: &mut Vec<String>,
 ) {
     let entries = match std::fs::read_dir(directory) {
@@ -1049,18 +1698,83 @@ fn render_project_tree(
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if file_type.is_dir() {
-            egui::CollapsingHeader::new(format!("📁 {name}"))
-                .id_salt(&path)
-                .show(ui, |ui| {
-                    render_project_tree(ui, &path, selected_file, errors)
+            let (_, header_label, _) =
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    ui.make_persistent_id(&path),
+                    false,
+                )
+                .show_header(ui, |ui| {
+                    let response = ui.selectable_label(
+                        selected_file.as_ref() == Some(&path),
+                        format!("📁 {name}"),
+                    );
+                    if response.clicked() {
+                        *selected_file = Some(path.clone());
+                    }
+                    response
+                })
+                .body(|ui| {
+                    render_project_tree(
+                        ui,
+                        &path,
+                        selected_file,
+                        clicked_file,
+                        context_action,
+                        errors,
+                    )
                 });
-        } else if ui
-            .selectable_label(selected_file.as_ref() == Some(&path), format!("📄 {name}"))
-            .clicked()
-        {
-            *selected_file = Some(path);
+            response_context_menu(&header_label.inner, &path, false, context_action);
+        } else {
+            let response =
+                ui.selectable_label(selected_file.as_ref() == Some(&path), format!("📄 {name}"));
+            if response.clicked() {
+                *selected_file = Some(path.clone());
+                *clicked_file = Some(path.clone());
+            }
+            response_context_menu(&response, &path, false, context_action);
         }
     }
+}
+
+fn response_context_menu(
+    response: &egui::Response,
+    path: &std::path::Path,
+    is_root: bool,
+    context_action: &mut Option<(TreeAction, PathBuf)>,
+) {
+    response.context_menu(|ui| {
+        if ui.button("New File").clicked() {
+            *context_action = Some((TreeAction::NewFile, path.to_path_buf()));
+            ui.close_menu();
+        }
+        if ui.button("New Folder").clicked() {
+            *context_action = Some((TreeAction::NewFolder, path.to_path_buf()));
+            ui.close_menu();
+        }
+        if !is_root {
+            ui.separator();
+            if ui.button("Rename").clicked() {
+                *context_action = Some((TreeAction::Rename, path.to_path_buf()));
+                ui.close_menu();
+            }
+            if ui.button("Delete").clicked() {
+                *context_action = Some((TreeAction::Delete, path.to_path_buf()));
+                ui.close_menu();
+            }
+        }
+    });
+}
+
+fn asset_name_for_path(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.parent()? != std::path::Path::new("assets") {
+        return None;
+    }
+    Some(format!(
+        "assets/{}",
+        relative.file_name()?.to_string_lossy()
+    ))
 }
 
 fn new_project() -> Project {
@@ -1083,9 +1797,54 @@ enum FileAction {
     Import,
 }
 
+#[derive(Clone, Copy)]
+enum TreeAction {
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+}
+
+struct FileDialogState {
+    action: project_files::EntryAction,
+    target: PathBuf,
+    name: String,
+}
+
+struct SaveProjectDialog {
+    name: String,
+    location: Option<PathBuf>,
+    close_after_save: bool,
+    error: Option<String>,
+}
+
+fn project_directory_in(location: &std::path::Path, name: &str) -> Result<PathBuf, String> {
+    project::validate_project_name(name)?;
+    let directory = location.join(name.trim());
+    if directory.exists() {
+        return Err(format!(
+            "'{}' already exists. Choose another project name or location.",
+            directory.display()
+        ));
+    }
+    Ok(directory)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::new_project;
+    use super::{new_project, project_directory_in};
+
+    #[test]
+    fn project_directory_is_created_inside_selected_location() {
+        let location = tempfile::tempdir().unwrap();
+
+        let directory = project_directory_in(location.path(), "  Space Game ").unwrap();
+
+        assert_eq!(directory, location.path().join("Space Game"));
+        std::fs::create_dir(&directory).unwrap();
+        assert!(project_directory_in(location.path(), "Space Game").is_err());
+        assert!(project_directory_in(location.path(), "").is_err());
+    }
 
     #[test]
     fn new_project_starts_without_sample_sprites_or_files() {
