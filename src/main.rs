@@ -716,7 +716,25 @@ impl Altadra {
             action,
             target,
             name,
+            focused: false,
         });
+    }
+
+    fn finish_inline_create(&mut self, outcome: InlineOutcome, ctx: &egui::Context) {
+        let Some(dialog) = self.file_dialog.take() else {
+            return;
+        };
+        if outcome == InlineOutcome::Cancel || dialog.name.trim().is_empty() {
+            return;
+        }
+        self.apply_file_dialog(dialog, ctx);
+        if let Some(dialog) = self.file_dialog.as_mut() {
+            if outcome == InlineOutcome::CommitOnBlur {
+                self.file_dialog = None;
+            } else {
+                dialog.focused = false;
+            }
+        }
     }
 
     fn apply_file_dialog(&mut self, dialog: FileDialogState, ctx: &egui::Context) {
@@ -916,7 +934,11 @@ impl Altadra {
     }
 
     fn file_dialog_window(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self.file_dialog.as_mut() else {
+        let Some(dialog) = self
+            .file_dialog
+            .as_mut()
+            .filter(|dialog| dialog.action == project_files::EntryAction::Rename)
+        else {
             return;
         };
         let title = match dialog.action {
@@ -1124,6 +1146,9 @@ impl Altadra {
                         .clicked()
                     {
                         self.left_panel_tab = LeftPanelTab::Scene;
+                        if inline_create_target(&self.file_dialog).is_some() {
+                            self.file_dialog = None;
+                        }
                     }
                 });
                 ui.separator();
@@ -1165,13 +1190,18 @@ impl Altadra {
 
                             let mut errors = Vec::new();
                             let mut clicked_file = None;
+                            let mut inline_outcome = None;
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                let (_, header_label, _) =
+                                let mut root_state =
                                     egui::collapsing_header::CollapsingState::load_with_default_open(
                                         ui.ctx(),
                                         ui.make_persistent_id(&root),
                                         true,
-                                    )
+                                    );
+                                if inline_create_target(&self.file_dialog).is_some() {
+                                    root_state.set_open(true);
+                                }
+                                let (_, header_label, _) = root_state
                                     .show_header(ui, |ui| {
                                         let response = ui.selectable_label(
                                             self.selected_file.as_ref() == Some(&root),
@@ -1183,14 +1213,15 @@ impl Altadra {
                                         response
                                     })
                                     .body(|ui| {
-                                        render_project_tree(
-                                            ui,
-                                            &root,
-                                            &mut self.selected_file,
-                                            &mut clicked_file,
-                                            &mut context_action,
-                                            &mut errors,
-                                        );
+                                        let mut tree = TreeContext {
+                                            selected_file: &mut self.selected_file,
+                                            clicked_file: &mut clicked_file,
+                                            context_action: &mut context_action,
+                                            errors: &mut errors,
+                                            inline_create: &mut self.file_dialog,
+                                            inline_outcome: &mut inline_outcome,
+                                        };
+                                        render_project_tree(ui, &root, &mut tree);
                                     });
                                 response_context_menu(
                                     &header_label.inner,
@@ -1212,6 +1243,9 @@ impl Altadra {
                                     &mut context_action,
                                 );
                             });
+                            if let Some(outcome) = inline_outcome {
+                                self.finish_inline_create(outcome, ctx);
+                            }
                             if let Some((action, path)) = context_action {
                                 self.handle_tree_action(action, path);
                             }
@@ -1644,18 +1678,13 @@ enum LeftPanelTab {
     Scene,
 }
 
-fn render_project_tree(
-    ui: &mut egui::Ui,
-    directory: &std::path::Path,
-    selected_file: &mut Option<PathBuf>,
-    clicked_file: &mut Option<PathBuf>,
-    context_action: &mut Option<(TreeAction, PathBuf)>,
-    errors: &mut Vec<String>,
-) {
+fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mut TreeContext<'_>) {
+    render_inline_create(ui, directory, tree);
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
-            errors.push(format!("Could not read {}: {error}", directory.display()));
+            tree.errors
+                .push(format!("Could not read {}: {error}", directory.display()));
             return;
         }
     };
@@ -1691,50 +1720,114 @@ fn render_project_tree(
         let (entry, file_type) = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                errors.push(error);
+                tree.errors.push(error);
                 continue;
             }
         };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if file_type.is_dir() {
-            let (_, header_label, _) =
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    ui.make_persistent_id(&path),
-                    false,
-                )
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                ui.make_persistent_id(&path),
+                false,
+            );
+            if inline_create_target(tree.inline_create)
+                .is_some_and(|target| target.starts_with(&path))
+            {
+                state.set_open(true);
+            }
+            let (_, header_label, _) = state
                 .show_header(ui, |ui| {
                     let response = ui.selectable_label(
-                        selected_file.as_ref() == Some(&path),
+                        tree.selected_file.as_ref() == Some(&path),
                         format!("📁 {name}"),
                     );
                     if response.clicked() {
-                        *selected_file = Some(path.clone());
+                        *tree.selected_file = Some(path.clone());
                     }
                     response
                 })
-                .body(|ui| {
-                    render_project_tree(
-                        ui,
-                        &path,
-                        selected_file,
-                        clicked_file,
-                        context_action,
-                        errors,
-                    )
-                });
-            response_context_menu(&header_label.inner, &path, false, context_action);
+                .body(|ui| render_project_tree(ui, &path, tree));
+            response_context_menu(&header_label.inner, &path, false, tree.context_action);
         } else {
-            let response =
-                ui.selectable_label(selected_file.as_ref() == Some(&path), format!("📄 {name}"));
+            let response = ui.selectable_label(
+                tree.selected_file.as_ref() == Some(&path),
+                format!("📄 {name}"),
+            );
             if response.clicked() {
-                *selected_file = Some(path.clone());
-                *clicked_file = Some(path.clone());
+                *tree.selected_file = Some(path.clone());
+                *tree.clicked_file = Some(path.clone());
             }
-            response_context_menu(&response, &path, false, context_action);
+            response_context_menu(&response, &path, false, tree.context_action);
         }
     }
+}
+
+struct TreeContext<'a> {
+    selected_file: &'a mut Option<PathBuf>,
+    clicked_file: &'a mut Option<PathBuf>,
+    context_action: &'a mut Option<(TreeAction, PathBuf)>,
+    errors: &'a mut Vec<String>,
+    inline_create: &'a mut Option<FileDialogState>,
+    inline_outcome: &'a mut Option<InlineOutcome>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineOutcome {
+    Commit,
+    CommitOnBlur,
+    Cancel,
+}
+
+fn inline_create_target(dialog: &Option<FileDialogState>) -> Option<&std::path::Path> {
+    dialog
+        .as_ref()
+        .filter(|dialog| dialog.action != project_files::EntryAction::Rename)
+        .map(|dialog| dialog.target.as_path())
+}
+
+fn render_inline_create(
+    ui: &mut egui::Ui,
+    directory: &std::path::Path,
+    tree: &mut TreeContext<'_>,
+) {
+    let Some(dialog) = tree
+        .inline_create
+        .as_mut()
+        .filter(|dialog| dialog.action != project_files::EntryAction::Rename)
+    else {
+        return;
+    };
+    if dialog.target != directory {
+        return;
+    }
+    let (icon, hint) = if dialog.action == project_files::EntryAction::NewFolder {
+        ("📁", "Folder name")
+    } else {
+        ("📄", "File name")
+    };
+    ui.horizontal(|ui| {
+        ui.label(icon);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut dialog.name)
+                .hint_text(hint)
+                .desired_width(f32::INFINITY),
+        );
+        if !dialog.focused {
+            response.request_focus();
+            dialog.focused = true;
+        }
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            *tree.inline_outcome = Some(InlineOutcome::Cancel);
+        } else if response.lost_focus() {
+            *tree.inline_outcome = Some(if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                InlineOutcome::Commit
+            } else {
+                InlineOutcome::CommitOnBlur
+            });
+        }
+    });
 }
 
 fn response_context_menu(
@@ -1809,6 +1902,7 @@ struct FileDialogState {
     action: project_files::EntryAction,
     target: PathBuf,
     name: String,
+    focused: bool,
 }
 
 struct SaveProjectDialog {
