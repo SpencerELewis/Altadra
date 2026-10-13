@@ -136,7 +136,8 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-Windows CI runs formatting, tests, Clippy, and release builds.
+Windows CI runs formatting, tests, Clippy, and release builds. Architecture notes,
+invariants, and contributor/AI-agent guidance are in [AGENTS.md](AGENTS.md).
 
 ## Scope
 
