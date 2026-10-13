@@ -3,6 +3,8 @@
     windows_subsystem = "windows"
 )]
 
+mod document_editor;
+pub mod documents;
 mod project;
 mod project_files;
 mod recent;
@@ -13,7 +15,6 @@ use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
 use project::Project;
 use recent::RecentProjects;
 use runtime::Runtime;
-use scene::{Scene, Sprite};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -37,6 +38,7 @@ struct TextDocument {
     contents: String,
     dirty: bool,
     preview: bool,
+    raw: bool,
 }
 
 impl TextDocument {
@@ -73,6 +75,7 @@ impl EditorFiles {
             contents,
             dirty: false,
             preview,
+            raw: false,
         };
         let index = if preview
             && let Some(index) = self
@@ -120,6 +123,31 @@ impl EditorFiles {
             file.save(root)?;
         }
         Ok(())
+    }
+
+    fn read_document(
+        &self,
+        root: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Result<documents::Document, String> {
+        if let Some(file) = self.documents.iter().find(|file| file.path == path) {
+            return documents::Document::parse(
+                path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
+                &file.contents,
+            );
+        }
+        documents::load(root, path)
+    }
+
+    fn read_script(
+        &self,
+        root: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Result<String, String> {
+        if let Some(file) = self.documents.iter().find(|file| file.path == path) {
+            return Ok(file.contents.clone());
+        }
+        project_files::read_text_file(root, path)
     }
 }
 
@@ -344,7 +372,7 @@ impl Altadra {
         self.dirty = false;
         self.runtime = None;
         self.page = AppPage::Editor;
-        self.error = None;
+        self.error = self.project.load_warning.clone();
         self.refresh_textures(ctx);
         if let Some(path) = self.project.path.clone() {
             self.remember_project(&path);
@@ -371,7 +399,15 @@ impl Altadra {
         };
         self.activate_project(new_project(), ctx);
         self.selected_file = Some(workspace.path().to_path_buf());
+        let root = workspace.path().to_path_buf();
         self.file_workspace = Some(workspace);
+        self.project.manifest.name = self.project_name.trim().to_owned();
+        if let Err(error) = self.project.save(&root) {
+            self.error = Some(error);
+            return;
+        }
+        self.project.path = None;
+        self.open_project_file(root.join(&self.project.manifest_path), false);
         self.dirty = true;
         self.status = "New project is empty and unsaved. Add content, then save it from the toolbar or when exiting.".into();
     }
@@ -387,8 +423,33 @@ impl Altadra {
         if self.page == AppPage::Editor && !self.confirm_discard() {
             return;
         }
-        match Project::load(path) {
-            Ok(project) => self.activate_project(project, ctx),
+        let has_manifest = match Project::find_manifest(path) {
+            Ok(manifest) => manifest.is_some(),
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        let result = if !has_manifest && path.join("scene.json").exists() {
+            if rfd::MessageDialog::new().set_title("Upgrade legacy project")
+                .set_description("Convert this project into TOML object and level files? Original files will be kept.")
+                .set_buttons(rfd::MessageButtons::YesNo).show() != rfd::MessageDialogResult::Yes {
+                return;
+            }
+            project::migrate_legacy(path)
+        } else {
+            Project::load(path)
+        };
+        match result {
+            Ok(project) => {
+                self.activate_project(project, ctx);
+                if let Some(root) = self.file_root_path() {
+                    self.open_project_file(root.join(&self.project.manifest_path), false);
+                }
+                if let Some(warning) = &self.project.load_warning {
+                    self.error = Some(warning.clone());
+                }
+            }
             Err(error) => self.error = Some(error),
         }
     }
@@ -504,7 +565,7 @@ impl Altadra {
                         }
                         ui.add_space(10.0);
                         ui.label(
-                            egui::RichText::new("Choose a folder containing scene.json and assets.")
+                            egui::RichText::new("Choose a folder containing an .altgame project.")
                                 .small()
                                 .color(Color32::GRAY),
                         );
@@ -537,7 +598,7 @@ impl Altadra {
                     let mut remove_path = None;
                     for recent in self.recents.projects.clone() {
                         ui.horizontal(|ui| {
-                            let exists = recent.path.join("scene.json").is_file();
+                            let exists = Project::is_project_folder(&recent.path);
                             let label = if exists {
                                 recent.name.as_str()
                             } else {
@@ -657,24 +718,48 @@ impl Altadra {
     }
 
     fn save_to(&mut self, directory: std::path::PathBuf) -> Result<(), String> {
+        self.save_project_snapshot(directory.clone())?;
+        self.remember_project(&directory);
+        Ok(())
+    }
+
+    fn save_project_snapshot(&mut self, directory: PathBuf) -> Result<(), String> {
         let root = self
             .file_root_path()
             .map(PathBuf::from)
             .ok_or_else(|| "No project folder is available.".to_owned())?;
         self.files.save_all(&root)?;
+        if let documents::Document::Game(game) =
+            self.read_document(&root.join(&self.project.manifest_path))?
+        {
+            self.project.manifest = game;
+        }
         let previous_path = self.project.path.clone();
         let workspace_path = self
             .file_workspace
             .as_ref()
             .map(|workspace| workspace.path().to_path_buf());
-        self.project.save(&directory).map_err(|e| e.to_string())?;
+        // Imports are already staged; cached images must not recreate renamed files.
+        let cached_assets = if self.project.format == project::ProjectFormat::Manifest {
+            Some(std::mem::take(&mut self.project.assets))
+        } else {
+            None
+        };
+        let result = self.project.save(&directory);
+        if let Some(assets) = cached_assets {
+            self.project.assets = assets;
+        }
+        result?;
         let saved_root = self
             .project
             .path
             .clone()
             .ok_or_else(|| "Saved project folder was not recorded.".to_owned())?;
         if let Some(workspace_path) = workspace_path {
-            project_files::copy_workspace_files(&workspace_path, &saved_root)?;
+            if let Err(error) = project_files::copy_workspace_files(&workspace_path, &saved_root) {
+                self.project.path = previous_path;
+                return Err(error);
+            }
             self.files.remap_paths(&workspace_path, &saved_root);
             if let Some(selected) = self.selected_file.as_mut()
                 && let Ok(relative) = selected.strip_prefix(&workspace_path)
@@ -695,7 +780,6 @@ impl Altadra {
         self.dirty = false;
         self.unsaved_entries.clear();
         self.status = format!("Saved {}", directory.display());
-        self.remember_project(&directory);
         Ok(())
     }
 
@@ -749,7 +833,15 @@ impl Altadra {
             self.status = "Save the project before opening its files.".into();
             return;
         };
-        match project_files::read_text_file(root, &path) {
+        let contents = if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        {
+            Ok(String::new())
+        } else {
+            project_files::read_text_file(root, &path)
+        };
+        match contents {
             Ok(contents) => {
                 if preview {
                     self.files.open_with_preview(path.clone(), contents, true);
@@ -796,6 +888,10 @@ impl Altadra {
                 self.error = Some("The assets folder cannot be renamed.".into());
                 return;
             }
+            if selected == root.join(&self.project.manifest_path) {
+                self.error = Some("The project settings filename is managed by Altadra.".into());
+                return;
+            }
             (name.to_string_lossy().into_owned(), selected.to_path_buf())
         } else {
             (String::new(), target)
@@ -805,7 +901,15 @@ impl Altadra {
             target,
             name,
             focused: false,
+            kind: None,
         });
+    }
+
+    fn begin_document(&mut self, extension: &'static str) {
+        self.begin_file_dialog(project_files::EntryAction::NewFile);
+        if let Some(dialog) = self.file_dialog.as_mut() {
+            dialog.kind = Some(extension);
+        }
     }
 
     fn finish_inline_create(&mut self, outcome: InlineOutcome, ctx: &egui::Context) {
@@ -842,15 +946,51 @@ impl Altadra {
         let Some(root) = self.file_root_path().map(std::path::Path::to_path_buf) else {
             return;
         };
+        let mut reference_updates = Vec::new();
         let result = match dialog.action {
             project_files::EntryAction::NewFile => {
-                project_files::create_file(&root, &dialog.target, &dialog.name)
+                if let Some(extension) = dialog.kind {
+                    let name = if dialog
+                        .name
+                        .to_ascii_lowercase()
+                        .ends_with(&format!(".{extension}"))
+                    {
+                        dialog.name.clone()
+                    } else {
+                        format!("{}.{extension}", dialog.name)
+                    };
+                    let title = std::path::Path::new(&name)
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("Untitled")
+                        .to_owned();
+                    let contents = match extension {
+                        "altobject" => documents::Document::Object(documents::ObjectDocument::new(title)).to_toml(),
+                        "altscene" => documents::Document::Level(documents::LevelDocument { version: 1, name: title, instances: vec![] }).to_toml(),
+                        "lua" => Ok("return function(entity, input, dt)\n    -- Update this instance here.\nend\n".into()),
+                        _ => Err("Unsupported document template.".into()),
+                    };
+                    contents.and_then(|contents| {
+                        project_files::create_text_file(&root, &dialog.target, &name, &contents)
+                    })
+                } else {
+                    project_files::create_file(&root, &dialog.target, &dialog.name)
+                }
             }
             project_files::EntryAction::NewFolder => {
                 project_files::create_folder(&root, &dialog.target, &dialog.name)
             }
             project_files::EntryAction::Rename => {
                 let old_path = dialog.target.clone();
+                let new_path = old_path.parent().unwrap_or(&root).join(&dialog.name);
+                match self.rewritten_references(&old_path, &new_path) {
+                    Ok(updates) => reference_updates = updates,
+                    Err(error) => {
+                        self.error = Some(error);
+                        self.file_dialog = Some(dialog);
+                        return;
+                    }
+                }
                 let asset_rename = asset_name_for_path(&root, &old_path)
                     .filter(|name| self.project.assets.contains_key(name))
                     .map(|old_name| {
@@ -894,6 +1034,32 @@ impl Altadra {
         match result {
             Ok(path) => {
                 let path = tree_form_path(&root, path);
+                for (mut document_path, document) in reference_updates {
+                    if let Ok(relative) = document_path.strip_prefix(&dialog.target) {
+                        document_path = path.join(relative);
+                    }
+                    let contents = match document.to_toml() {
+                        Ok(contents) => contents,
+                        Err(error) => {
+                            self.error = Some(error);
+                            return;
+                        }
+                    };
+                    let index = if let Some(index) = self
+                        .files
+                        .documents
+                        .iter()
+                        .position(|file| file.path == document_path)
+                    {
+                        index
+                    } else {
+                        self.files.open(document_path, contents.clone());
+                        self.files.documents.len() - 1
+                    };
+                    self.files.documents[index].contents = contents;
+                    self.files.documents[index].dirty = true;
+                    self.files.documents[index].preview = false;
+                }
                 if dialog.action == project_files::EntryAction::Rename {
                     let old_path = &dialog.target;
                     for entry in &mut self.unsaved_entries {
@@ -930,12 +1096,12 @@ impl Altadra {
         ) else {
             return;
         };
-        if entry == root {
-            self.error = Some("The project folder itself cannot be removed.".into());
+        if entry == root || entry == root.join(&self.project.manifest_path) {
+            self.error = Some("The project folder and its settings file cannot be removed.".into());
             return;
         }
         let is_directory = entry.is_dir();
-        let description = if is_directory {
+        let mut description = if is_directory {
             format!(
                 "Remove '{}' and everything inside it?",
                 entry.file_name().unwrap_or_default().to_string_lossy()
@@ -946,6 +1112,37 @@ impl Altadra {
                 entry.file_name().unwrap_or_default().to_string_lossy()
             )
         };
+        let dependencies = (|| {
+            let relative = entry
+                .strip_prefix(&root)
+                .map_err(|error| error.to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let mut dependencies = Vec::new();
+            for path in document_editor::project_entries(&root)? {
+                if !path.starts_with(&entry)
+                    && matches!(
+                        path.extension().and_then(|ext| ext.to_str()),
+                        Some("altgame" | "altobject" | "altscene")
+                    )
+                    && self.read_document(&path)?.references_under(&relative)
+                {
+                    dependencies.push(path.display().to_string());
+                }
+            }
+            Ok::<_, String>(dependencies)
+        })();
+        match dependencies {
+            Ok(dependencies) if !dependencies.is_empty() => description.push_str(&format!(
+                "\n\nThis will break references in:\n{}",
+                dependencies.join("\n")
+            )),
+            Ok(_) => {}
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        }
         if rfd::MessageDialog::new()
             .set_title("Delete project item")
             .set_description(description)
@@ -1032,6 +1229,9 @@ impl Altadra {
             TreeAction::NewFolder => self.begin_file_dialog(project_files::EntryAction::NewFolder),
             TreeAction::Rename => self.begin_file_dialog(project_files::EntryAction::Rename),
             TreeAction::Delete => self.delete_selected_entry(),
+            TreeAction::Object => self.begin_document("altobject"),
+            TreeAction::Level => self.begin_document("altscene"),
+            TreeAction::Behavior => self.begin_document("lua"),
         }
     }
 
@@ -1072,21 +1272,23 @@ impl Altadra {
                         .and_then(|bytes| {
                             let name =
                                 self.project.import_png(&bytes).map_err(|e| e.to_string())?;
-                            if let Some(workspace) = &self.file_workspace {
-                                project_files::stage_asset_file(workspace.path(), &name, &bytes)?;
-                            }
+                            let root = self
+                                .file_root_path()
+                                .ok_or_else(|| "No project folder is available.".to_owned())?;
+                            project_files::stage_asset_file(root, &name, &bytes)?;
                             Ok(name)
                         }) {
                         Ok(name) => {
-                            if let Some(sprite) = self.selected_sprite_mut() {
-                                sprite.asset = Some(name);
-                            } else {
-                                let mut sprite = Sprite::new("Imported sprite");
-                                sprite.asset = Some(name);
-                                self.selected = Some(sprite.id.clone());
-                                self.project.scene.sprites.push(sprite);
+                            if let Some(index) = self.files.active
+                                && let Ok(documents::Document::Object(mut object)) =
+                                    self.read_document(&self.files.documents[index].path)
+                            {
+                                object.appearance.image = Some(name.clone());
+                                self.update_document(index, &documents::Document::Object(object));
                             }
-                            self.dirty = true;
+                            if let Some(root) = self.file_root_path() {
+                                self.unsaved_entries.push(root.join(name));
+                            }
                             self.refresh_textures(ctx);
                             self.status = format!("Imported {}", file.display());
                             self.error = None;
@@ -1095,19 +1297,6 @@ impl Altadra {
                     }
                 }
             }
-        }
-    }
-
-    fn selected_sprite_mut(&mut self) -> Option<&mut Sprite> {
-        let id = self.selected.as_deref()?;
-        self.project.scene.sprites.iter_mut().find(|s| s.id == id)
-    }
-
-    fn selected_scene_mut(&mut self) -> &mut Scene {
-        if let Some(runtime) = &mut self.runtime {
-            &mut runtime.scene
-        } else {
-            &mut self.project.scene
         }
     }
 
@@ -1139,6 +1328,38 @@ impl Altadra {
         }
     }
 
+    fn prepare_play(&mut self, ctx: &egui::Context) -> Result<(), String> {
+        let root = self
+            .file_root_path()
+            .map(PathBuf::from)
+            .ok_or_else(|| "No project folder is available.".to_owned())?;
+        let level = if let Some(file) = self
+            .files
+            .active
+            .and_then(|index| self.files.documents.get(index))
+            && file
+                .path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("altscene"))
+        {
+            self.read_document(&file.path)?
+        } else {
+            let documents::Document::Game(game) =
+                self.read_document(&root.join(&self.project.manifest_path))?
+            else {
+                return Err("Project settings file is invalid.".into());
+            };
+            let path = game.starting_level.ok_or_else(|| {
+                "Choose a starting level in the project settings, or open a level tab.".to_owned()
+            })?;
+            self.read_document(&root.join(path))?
+        };
+        let documents::Document::Level(level) = level else {
+            return Err("The selected document is not a level.".into());
+        };
+        self.resolve_level(&level, ctx)
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1168,13 +1389,15 @@ impl Altadra {
                 ui.separator();
                 if self.runtime.is_none() {
                     if ui.button("▶ Play").clicked() {
-                        match Runtime::start(&self.project.scene) {
+                        let result = self.prepare_play(ctx).and_then(|()| Runtime::start(&self.project.scene));
+                        match result {
                             Ok(runtime) => {
                                 self.runtime = Some(runtime);
                                 self.status = "Playing — click the viewport and use WASD or arrows. Lua scripts run on fixed 60 Hz ticks.".into();
                                 self.error = None;
                                 self.last_tick = Instant::now();
                             }
+
                             Err(error) => self.error = Some(error),
                         }
                     }
@@ -1204,13 +1427,6 @@ impl Altadra {
                     {
                         self.left_panel_tab = LeftPanelTab::Project;
                     }
-                    if ui
-                        .selectable_label(self.left_panel_tab == LeftPanelTab::Scene, "Scene")
-                        .clicked()
-                    {
-                        self.left_panel_tab = LeftPanelTab::Scene;
-                        self.file_dialog = None;
-                    }
                 });
                 ui.separator();
 
@@ -1235,11 +1451,12 @@ impl Altadra {
                                     .map(|file| file.path.clone()),
                             );
                             if self.dirty {
-                                dirty_paths.push(root.join("scene.json"));
+                                dirty_paths.push(root.join(&self.project.manifest_path));
                             }
                             let project_unsaved = all_unsaved || !dirty_paths.is_empty();
                             let mut create_file = false;
                             let mut create_folder = false;
+                            let mut new_kind = None;
                             let mut context_action = None;
                             ui.horizontal(|ui| {
                                 let header = ui
@@ -1270,6 +1487,17 @@ impl Altadra {
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         ui.menu_button("+  ▾", |ui| {
+                                            for (label, extension) in [
+                                                ("New Object", "altobject"),
+                                                ("New Level", "altscene"),
+                                                ("New Behavior", "lua"),
+                                            ] {
+                                                if ui.button(label).clicked() {
+                                                    new_kind = Some(extension);
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                            ui.separator();
                                             if ui.button("New File").clicked() {
                                                 create_file = true;
                                                 ui.close_menu();
@@ -1282,7 +1510,9 @@ impl Altadra {
                                     },
                                 );
                             });
-                            if create_file {
+                            if let Some(extension) = new_kind {
+                                self.begin_document(extension);
+                            } else if create_file {
                                 self.begin_file_dialog(project_files::EntryAction::NewFile);
                             } else if create_folder {
                                 self.begin_file_dialog(project_files::EntryAction::NewFolder);
@@ -1349,43 +1579,6 @@ impl Altadra {
                         } else {
                             ui.label("Create a project to manage its files.");
                         }
-                    }
-                    LeftPanelTab::Scene => {
-                        ui.heading("Scene");
-                        let sprites = &self.project.scene.sprites;
-                        let selected = self.selected.clone();
-                        if sprites.is_empty() {
-                            ui.label("This scene is empty. Add a sprite to get started.");
-                        }
-                        for sprite in sprites {
-                            let label = format!("▰  {}", sprite.name);
-                            if ui
-                                .selectable_label(selected.as_deref() == Some(&sprite.id), label)
-                                .clicked()
-                            {
-                                self.selected = Some(sprite.id.clone());
-                            }
-                        }
-                        ui.separator();
-                        ui.add_enabled_ui(self.runtime.is_none(), |ui| {
-                            if ui.button("+ Add sprite").clicked() {
-                                let sprite = Sprite::new(format!(
-                                    "Sprite {}",
-                                    self.project.scene.sprites.len() + 1
-                                ));
-                                self.selected = Some(sprite.id.clone());
-                                self.project.scene.sprites.push(sprite);
-                                self.dirty = true;
-                            }
-                            if ui.button("Delete selected").clicked()
-                                && let Some(id) = &self.selected
-                            {
-                                self.project.scene.sprites.retain(|s| &s.id != id);
-                                self.selected =
-                                    self.project.scene.sprites.first().map(|s| s.id.clone());
-                                self.dirty = true;
-                            }
-                        });
                     }
                 }
             });
@@ -1455,6 +1648,10 @@ impl Altadra {
                 return;
             };
             let path = self.files.documents[index].path.clone();
+            if self.runtime.is_some() {
+                self.viewport_ui(ui);
+                return;
+            }
             ui.separator();
             ui.horizontal(|ui| {
                 let display_path = self
@@ -1476,6 +1673,73 @@ impl Altadra {
                 }
             });
             ui.separator();
+            if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("altgame" | "altobject" | "altscene")
+            ) {
+                let raw = &mut self.files.documents[index].raw;
+                ui.checkbox(raw, "Edit TOML source");
+                if !*raw {
+                    match documents::Document::parse(
+                        path.extension().and_then(|ext| ext.to_str()).unwrap_or(""),
+                        &self.files.documents[index].contents,
+                    ) {
+                        Ok(documents::Document::Level(level)) => {
+                            match self.resolve_level(&level, ctx) {
+                                Ok(()) => self.viewport_ui(ui),
+                                Err(error) => {
+                                    ui.colored_label(Color32::LIGHT_RED, &error);
+                                    self.error = Some(error);
+                                }
+                            }
+                        }
+                        Ok(documents::Document::Object(object)) => {
+                            ui.heading(&object.name);
+                            ui.label(
+                                "Edit object defaults and choose artwork/behavior in Properties.",
+                            );
+                            if let Some(image) = &object.appearance.image {
+                                self.image_preview(ui, &path, Some(image), ctx);
+                            } else {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    Vec2::new(
+                                        object.appearance.width as f32,
+                                        object.appearance.height as f32,
+                                    )
+                                    .min(ui.available_size()),
+                                    Sense::hover(),
+                                );
+                                ui.painter().rect_filled(
+                                    rect,
+                                    0.0,
+                                    Color32::from_rgba_unmultiplied(
+                                        object.appearance.tint[0],
+                                        object.appearance.tint[1],
+                                        object.appearance.tint[2],
+                                        object.appearance.tint[3],
+                                    ),
+                                );
+                            }
+                        }
+                        Ok(documents::Document::Game(game)) => {
+                            ui.heading(&game.name);
+                            ui.label("Choose the starting level in Properties, then use Play.");
+                        }
+                        Err(error) => {
+                            ui.colored_label(Color32::LIGHT_RED, &error);
+                            ui.label("Enable Edit TOML source to repair this document.");
+                        }
+                    }
+                    return;
+                }
+            }
+            if path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+            {
+                self.image_preview(ui, &path, None, ctx);
+                return;
+            }
             let response = ui.add(
                 egui::TextEdit::multiline(&mut self.files.documents[index].contents)
                     .id_source(("file_editor", &path))
@@ -1518,248 +1782,390 @@ impl Altadra {
     }
 
     fn inspector(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::right("inspector")
+        if self.runtime.is_some() {
+            return;
+        }
+        let Some(index) = self.files.active else {
+            return;
+        };
+        let file = &self.files.documents[index];
+        if file.raw {
+            return;
+        }
+        let extension = file
+            .path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+        let Ok(mut document) = documents::Document::parse(extension, &file.contents) else {
+            return;
+        };
+        let entries = match self.project_file_names() {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
+        let inherited = if let documents::Document::Level(level) = &document
+            && let Some(instance) = level
+                .instances
+                .iter()
+                .find(|instance| self.selected.as_ref() == Some(&instance.id))
+            && let Some(root) = self.file_root_path()
+            && let Ok(documents::Document::Object(object)) =
+                self.read_document(&root.join(&instance.object))
+        {
+            let mut sprite = scene::Sprite::new(object.name);
+            sprite.width = object.appearance.width;
+            sprite.height = object.appearance.height;
+            sprite.vx = object.motion.vx;
+            sprite.vy = object.motion.vy;
+            sprite.visible = object.appearance.visible;
+            sprite.tint = object.appearance.tint;
+            Some(sprite)
+        } else {
+            None
+        };
+        let mut changed = false;
+        egui::SidePanel::right("document_properties")
             .resizable(true)
-            .default_width(280.0)
+            .default_width(300.0)
             .show(ctx, |ui| {
-                ui.heading("Properties");
-                let Some(id) = self.selected.clone() else {
-                    ui.label("Select a sprite in the hierarchy or viewport.");
-                    return;
-                };
-                let editing_enabled = self.runtime.is_none();
-                let Some(sprite) = self
-                    .selected_scene_mut()
-                    .sprites
-                    .iter_mut()
-                    .find(|s| s.id == id)
-                else {
-                    ui.label("Selected sprite is not in this scene.");
-                    return;
-                };
-                let mut changed = false;
-                ui.add_enabled_ui(editing_enabled, |ui| {
-                    changed |= ui.text_edit_singleline(&mut sprite.name).changed();
-                    ui.horizontal(|ui| {
-                        ui.label("Position");
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut sprite.x).prefix("X "))
-                            .changed();
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut sprite.y).prefix("Y "))
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Size");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut sprite.width)
-                                    .range(1.0..=4096.0)
-                                    .prefix("W "),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut sprite.height)
-                                    .range(1.0..=4096.0)
-                                    .prefix("H "),
-                            )
-                            .changed();
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Scale");
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut sprite.scale_x)
-                                    .range(0.01..=100.0)
-                                    .prefix("X "),
-                            )
-                            .changed();
-                        changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut sprite.scale_y)
-                                    .range(0.01..=100.0)
-                                    .prefix("Y "),
-                            )
-                            .changed();
-                    });
-                    changed |= ui
-                        .add(
-                            egui::Slider::new(&mut sprite.rotation, -360.0..=360.0)
-                                .text("Rotation °"),
-                        )
-                        .changed();
-                    let mut tint = Color32::from_rgba_unmultiplied(
-                        sprite.tint[0],
-                        sprite.tint[1],
-                        sprite.tint[2],
-                        sprite.tint[3],
+                ui.add_enabled_ui(self.runtime.is_none(), |ui| {
+                    changed = document_editor::properties(
+                        ui,
+                        &mut document,
+                        &entries,
+                        &mut self.selected,
+                        inherited.as_ref(),
                     );
-                    if ui.color_edit_button_srgba(&mut tint).changed() {
-                        sprite.tint = tint.to_array();
-                        changed = true;
-                    }
-                    changed |= ui.checkbox(&mut sprite.visible, "Visible").changed();
-                    ui.separator();
-                    ui.label("Velocity (units/second)");
-                    ui.horizontal(|ui| {
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut sprite.vx).prefix("X "))
-                            .changed();
-                        changed |= ui
-                            .add(egui::DragValue::new(&mut sprite.vy).prefix("Y "))
-                            .changed();
-                    });
-                    ui.separator();
-                    ui.heading("Lua gameplay script");
-                    ui.label("Return a function(entity, input, dt). Edit entity.x/y.");
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::multiline(&mut sprite.script)
-                                .desired_rows(12)
-                                .code_editor()
-                                .desired_width(f32::INFINITY),
-                        )
-                        .changed();
-                    if let Some(asset) = &sprite.asset {
-                        ui.small(format!("Image: {asset}"));
-                    }
                 });
-                if changed {
-                    if editing_enabled {
-                        self.dirty = true;
-                    } else {
-                        self.status = "Play mode changes are temporary.".into();
-                    }
-                }
             });
+        if changed {
+            self.update_document(index, &document);
+        }
+    }
+
+    fn project_file_names(&self) -> Result<Vec<String>, String> {
+        let root = self
+            .file_root_path()
+            .ok_or_else(|| "No project folder is available.".to_owned())?;
+        document_editor::project_entries(root)?
+            .into_iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
+    fn rewritten_references(
+        &self,
+        old: &std::path::Path,
+        new: &std::path::Path,
+    ) -> Result<Vec<(PathBuf, documents::Document)>, String> {
+        let root = self
+            .file_root_path()
+            .ok_or_else(|| "No project folder is available.".to_owned())?;
+        let old = old
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let new = new
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let mut updates = Vec::new();
+        for path in document_editor::project_entries(root)? {
+            if matches!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("altgame" | "altobject" | "altscene")
+            ) {
+                let mut document = self.read_document(&path)?;
+                if document.rewrite_references(&old, &new) {
+                    document.validate()?;
+                    updates.push((path, document));
+                }
+            }
+        }
+        Ok(updates)
+    }
+
+    fn resolve_level(
+        &mut self,
+        level: &documents::LevelDocument,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        if self.runtime.is_some() {
+            return Ok(());
+        }
+        let root = self
+            .file_root_path()
+            .ok_or_else(|| "No project folder is available.".to_owned())?;
+        let (scene, assets) = Project::resolve_scene(
+            root,
+            level,
+            |path| self.read_document(path),
+            |path| self.read_script(path),
+        )?;
+        self.project.scene = scene;
+        let textures_changed = assets
+            .iter()
+            .any(|(name, bytes)| self.project.assets.get(name) != Some(bytes));
+        self.project.assets.extend(assets);
+        if textures_changed {
+            self.refresh_textures(ctx);
+        }
+        Ok(())
+    }
+
+    fn read_document(&self, path: &std::path::Path) -> Result<documents::Document, String> {
+        self.files.read_document(
+            self.file_root_path()
+                .ok_or_else(|| "No project folder is available.".to_owned())?,
+            path,
+        )
+    }
+
+    fn read_script(&self, path: &std::path::Path) -> Result<String, String> {
+        self.files.read_script(
+            self.file_root_path()
+                .ok_or_else(|| "No project folder is available.".to_owned())?,
+            path,
+        )
+    }
+
+    fn image_preview(
+        &mut self,
+        ui: &mut egui::Ui,
+        path: &std::path::Path,
+        reference: Option<&str>,
+        ctx: &egui::Context,
+    ) {
+        let result = (|| {
+            let root = self
+                .file_root_path()
+                .ok_or_else(|| "No project folder is available.".to_owned())?;
+            let image_path = reference
+                .map(|name| root.join(name))
+                .unwrap_or_else(|| path.to_path_buf());
+            let bytes = project_files::read_png(root, &image_path)?;
+            let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
+                .map_err(|error| error.to_string())?;
+            if image.width() > 4096 || image.height() > 4096 {
+                return Err("PNG dimensions are limited to 4096 x 4096.".to_owned());
+            }
+            let image = image.to_rgba8();
+            let texture = ctx.load_texture(
+                image_path.display().to_string(),
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [image.width() as usize, image.height() as usize],
+                    image.as_raw(),
+                ),
+                Default::default(),
+            );
+            Ok(texture)
+        })();
+        match result {
+            Ok(texture) => {
+                ui.add(egui::Image::new(&texture).max_size(ui.available_size()));
+            }
+            Err(error) => {
+                ui.colored_label(Color32::LIGHT_RED, &error);
+                self.error = Some(error);
+            }
+        }
+    }
+
+    fn update_document(&mut self, index: usize, document: &documents::Document) {
+        match document.to_toml() {
+            Ok(contents) => {
+                let file = &mut self.files.documents[index];
+                file.contents = contents;
+                file.dirty = true;
+                file.preview = false;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
     }
 
     fn viewport(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label("Viewport · origin at center · +X right · +Y down");
-            let available = ui.available_size();
-            let (rect, response) = ui.allocate_exact_size(available, Sense::click());
-            if response.clicked() && self.runtime.is_some() {
-                response.request_focus();
+        egui::CentralPanel::default().show(ctx, |ui| self.viewport_ui(ui));
+    }
+
+    fn viewport_ui(&mut self, ui: &mut egui::Ui) {
+        ui.label("Viewport · origin at center · +X right · +Y down");
+        let available = ui.available_size();
+        let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
+        if response.clicked() && self.runtime.is_some() {
+            response.request_focus();
+        }
+        self.viewport_focused = response.has_focus();
+        let scene = if let Some(runtime) = &self.runtime {
+            &runtime.scene
+        } else {
+            &self.project.scene
+        };
+        let scale = (rect.width() / 900.0).min(rect.height() / 650.0).max(0.1);
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(19, 26, 37));
+        let spacing = 32.0 * scale;
+        let center = rect.center();
+        let x0 = center.x.rem_euclid(spacing);
+        let y0 = center.y.rem_euclid(spacing);
+        for x in
+            std::iter::successors(Some(x0), |x| Some(x + spacing)).take_while(|x| *x < rect.right())
+        {
+            painter.line_segment(
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                Stroke::new(1.0_f32, Color32::from_rgb(36, 47, 63)),
+            );
+        }
+        for y in std::iter::successors(Some(y0), |y| Some(y + spacing))
+            .take_while(|y| *y < rect.bottom())
+        {
+            painter.line_segment(
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                Stroke::new(1.0_f32, Color32::from_rgb(36, 47, 63)),
+            );
+        }
+        for sprite in &scene.sprites {
+            if !sprite.visible {
+                continue;
             }
-            self.viewport_focused = response.has_focus();
-            let scene = if let Some(runtime) = &self.runtime {
-                &runtime.scene
-            } else {
-                &self.project.scene
-            };
-            let scale = (rect.width() / 900.0).min(rect.height() / 650.0).max(0.1);
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, 0.0, Color32::from_rgb(19, 26, 37));
-            let spacing = 32.0 * scale;
-            let center = rect.center();
-            let x0 = center.x.rem_euclid(spacing);
-            let y0 = center.y.rem_euclid(spacing);
-            for x in std::iter::successors(Some(x0), |x| Some(x + spacing))
-                .take_while(|x| *x < rect.right())
+            let center = Pos2::new(
+                center.x + sprite.x as f32 * scale,
+                center.y + sprite.y as f32 * scale,
+            );
+            let size = Vec2::new(
+                sprite.width as f32 * sprite.scale_x as f32 * scale,
+                sprite.height as f32 * sprite.scale_y as f32 * scale,
+            );
+            let color = Color32::from_rgba_unmultiplied(
+                sprite.tint[0],
+                sprite.tint[1],
+                sprite.tint[2],
+                sprite.tint[3],
+            );
+            let angle = (sprite.rotation as f32).to_radians();
+            let corners = rotated_corners(center, size, angle);
+            if let Some(texture) = sprite
+                .asset
+                .as_ref()
+                .and_then(|name| self.textures.get(name))
             {
-                painter.line_segment(
-                    [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                    Stroke::new(1.0_f32, Color32::from_rgb(36, 47, 63)),
-                );
-            }
-            for y in std::iter::successors(Some(y0), |y| Some(y + spacing))
-                .take_while(|y| *y < rect.bottom())
-            {
-                painter.line_segment(
-                    [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                    Stroke::new(1.0_f32, Color32::from_rgb(36, 47, 63)),
-                );
-            }
-            for sprite in &scene.sprites {
-                if !sprite.visible {
-                    continue;
-                }
-                let center = Pos2::new(
-                    center.x + sprite.x as f32 * scale,
-                    center.y + sprite.y as f32 * scale,
-                );
-                let size = Vec2::new(
-                    sprite.width as f32 * sprite.scale_x as f32 * scale,
-                    sprite.height as f32 * sprite.scale_y as f32 * scale,
-                );
-                let color = Color32::from_rgba_unmultiplied(
-                    sprite.tint[0],
-                    sprite.tint[1],
-                    sprite.tint[2],
-                    sprite.tint[3],
-                );
-                let angle = (sprite.rotation as f32).to_radians();
-                let corners = rotated_corners(center, size, angle);
-                if let Some(texture) = sprite
-                    .asset
-                    .as_ref()
-                    .and_then(|name| self.textures.get(name))
-                {
-                    let mut mesh = egui::Mesh::with_texture(texture.id());
-                    mesh.vertices = corners
-                        .iter()
-                        .zip([
-                            Pos2::new(0.0, 0.0),
-                            Pos2::new(1.0, 0.0),
-                            Pos2::new(1.0, 1.0),
-                            Pos2::new(0.0, 1.0),
-                        ])
-                        .map(|(pos, uv)| egui::epaint::Vertex {
-                            pos: *pos,
-                            uv,
-                            color,
-                        })
-                        .collect();
-                    mesh.add_triangle(0, 1, 2);
-                    mesh.add_triangle(0, 2, 3);
-                    painter.add(egui::Shape::mesh(mesh));
-                } else {
-                    painter.add(egui::Shape::convex_polygon(
-                        corners.to_vec(),
-                        color,
-                        Stroke::NONE,
-                    ));
-                }
-                if self.runtime.is_none() && self.selected.as_deref() == Some(&sprite.id) {
-                    for i in 0..4 {
-                        painter.line_segment(
-                            [corners[i], corners[(i + 1) % 4]],
-                            Stroke::new(5.0_f32, Color32::from_rgb(8, 12, 18)),
-                        );
-                    }
-                    for i in 0..4 {
-                        painter.line_segment(
-                            [corners[i], corners[(i + 1) % 4]],
-                            Stroke::new(2.5_f32, Color32::from_rgb(80, 205, 255)),
-                        );
-                    }
-                }
-            }
-            if response.clicked() && self.runtime.is_none() {
-                let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
-                let (wx, wy) = (pointer.x - rect.center().x, pointer.y - rect.center().y);
-                self.selected = scene
-                    .sprites
+                let mut mesh = egui::Mesh::with_texture(texture.id());
+                mesh.vertices = corners
                     .iter()
-                    .rev()
-                    .find(|s| {
-                        s.visible && {
-                            let radians = -(s.rotation as f32).to_radians();
-                            let dx = wx - s.x as f32 * scale;
-                            let dy = wy - s.y as f32 * scale;
-                            let local_x = (dx * radians.cos() - dy * radians.sin())
-                                / (s.scale_x as f32 * scale);
-                            let local_y = (dx * radians.sin() + dy * radians.cos())
-                                / (s.scale_y as f32 * scale);
-                            local_x.abs() <= s.width as f32 / 2.0
-                                && local_y.abs() <= s.height as f32 / 2.0
-                        }
+                    .zip([
+                        Pos2::new(0.0, 0.0),
+                        Pos2::new(1.0, 0.0),
+                        Pos2::new(1.0, 1.0),
+                        Pos2::new(0.0, 1.0),
+                    ])
+                    .map(|(pos, uv)| egui::epaint::Vertex {
+                        pos: *pos,
+                        uv,
+                        color,
                     })
-                    .map(|s| s.id.clone());
+                    .collect();
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                painter.add(egui::Shape::mesh(mesh));
+            } else {
+                painter.add(egui::Shape::convex_polygon(
+                    corners.to_vec(),
+                    color,
+                    Stroke::NONE,
+                ));
             }
-        });
+            if self.runtime.is_none() && self.selected.as_deref() == Some(&sprite.id) {
+                for i in 0..4 {
+                    painter.line_segment(
+                        [corners[i], corners[(i + 1) % 4]],
+                        Stroke::new(5.0_f32, Color32::from_rgb(8, 12, 18)),
+                    );
+                }
+                for i in 0..4 {
+                    painter.line_segment(
+                        [corners[i], corners[(i + 1) % 4]],
+                        Stroke::new(2.5_f32, Color32::from_rgb(80, 205, 255)),
+                    );
+                }
+            }
+        }
+        if (response.clicked() || response.drag_started()) && self.runtime.is_none() {
+            let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
+            let (wx, wy) = (pointer.x - rect.center().x, pointer.y - rect.center().y);
+            self.selected = scene
+                .sprites
+                .iter()
+                .rev()
+                .find(|s| {
+                    s.visible && {
+                        let radians = -(s.rotation as f32).to_radians();
+                        let dx = wx - s.x as f32 * scale;
+                        let dy = wy - s.y as f32 * scale;
+                        let local_x =
+                            (dx * radians.cos() - dy * radians.sin()) / (s.scale_x as f32 * scale);
+                        let local_y =
+                            (dx * radians.sin() + dy * radians.cos()) / (s.scale_y as f32 * scale);
+                        local_x.abs() <= s.width as f32 / 2.0
+                            && local_y.abs() <= s.height as f32 / 2.0
+                    }
+                })
+                .map(|s| s.id.clone());
+        }
+        if self.runtime.is_none()
+            && let Some(index) = self.files.active
+            && let Ok(documents::Document::Level(mut level)) =
+                self.read_document(&self.files.documents[index].path)
+        {
+            let mut changed = false;
+            if response.dragged()
+                && let Some(instance) = level
+                    .instances
+                    .iter_mut()
+                    .find(|instance| self.selected.as_ref() == Some(&instance.id))
+            {
+                let delta = ui.input(|input| input.pointer.delta());
+                instance.x += f64::from(delta.x / scale);
+                instance.y += f64::from(delta.y / scale);
+                changed = delta != Vec2::ZERO;
+            }
+            if let Some(path) = response.dnd_release_payload::<PathBuf>()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("altobject"))
+                && let Some(root) = self.file_root_path()
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                let pointer = ui
+                    .input(|input| input.pointer.latest_pos())
+                    .unwrap_or(rect.center());
+                let id = scene::Sprite::new("instance").id;
+                level.instances.push(documents::Instance {
+                    id: id.clone(),
+                    object: relative.to_string_lossy().replace('\\', "/"),
+                    x: f64::from((pointer.x - rect.center().x) / scale),
+                    y: f64::from((pointer.y - rect.center().y) / scale),
+                    rotation: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    overrides: documents::Overrides::default(),
+                });
+                self.selected = Some(id);
+                changed = true;
+            }
+            if changed {
+                self.update_document(index, &documents::Document::Level(level));
+            }
+        }
     }
 }
 
@@ -1804,8 +2210,13 @@ impl eframe::App for Altadra {
                 self.inspector(ctx);
                 if self.files.active.is_some() {
                     self.text_editor(ctx);
-                } else {
+                } else if self.runtime.is_some() {
                     self.viewport(ctx);
+                } else {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.heading("Project workspace");
+                        ui.label("Open a file, or use + to create an Object, Level, or Behavior.");
+                    });
                 }
                 self.save_project_dialog_window(ctx);
                 egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -1829,7 +2240,6 @@ enum AppPage {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LeftPanelTab {
     Project,
-    Scene,
 }
 
 fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mut TreeContext<'_>) {
@@ -1922,9 +2332,12 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
                 inline_name_edit(ui, dialog, "File name", tree.inline_outcome);
             });
         } else {
-            let response = ui.selectable_label(
+            let response = project_file_row(
+                ui,
+                &path,
+                &name,
                 tree.selected_file.as_ref() == Some(&path),
-                unsaved_text(&format!("📄 {name}"), tree.is_unsaved(&path)),
+                tree.is_unsaved(&path),
             );
             if response.clicked() {
                 *tree.selected_file = Some(path.clone());
@@ -1933,6 +2346,32 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
             response_context_menu(&response, &path, TreeEntryKind::File, tree.context_action);
         }
     }
+}
+
+fn project_file_row(
+    ui: &mut egui::Ui,
+    path: &std::path::Path,
+    name: &str,
+    selected: bool,
+    unsaved: bool,
+) -> egui::Response {
+    let response = ui
+        .push_id(path, |ui| {
+            ui.add(
+                egui::Button::new(unsaved_text(&format!("📄 {name}"), unsaved))
+                    .selected(selected)
+                    .frame(false)
+                    .sense(Sense::click_and_drag()),
+            )
+        })
+        .inner;
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("altobject"))
+    {
+        response.dnd_set_drag_payload(path.to_path_buf());
+    }
+    response
 }
 
 struct TreeContext<'a> {
@@ -2062,6 +2501,19 @@ fn response_context_menu(
     context_action: &mut Option<(TreeAction, PathBuf)>,
 ) {
     response.context_menu(|ui| {
+        if kind != TreeEntryKind::File {
+            for (label, action) in [
+                ("New Object", TreeAction::Object),
+                ("New Level", TreeAction::Level),
+                ("New Behavior", TreeAction::Behavior),
+            ] {
+                if ui.button(label).clicked() {
+                    *context_action = Some((action, path.to_path_buf()));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+        }
         if ui.button("New File").clicked() {
             *context_action = Some((TreeAction::NewFile, path.to_path_buf()));
             ui.close_menu();
@@ -2105,14 +2557,7 @@ fn asset_name_for_path(root: &std::path::Path, path: &std::path::Path) -> Option
 }
 
 fn new_project() -> Project {
-    Project {
-        scene: Scene {
-            version: 1,
-            sprites: Vec::new(),
-        },
-        path: None,
-        assets: Default::default(),
-    }
+    Project::default()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2130,6 +2575,9 @@ enum TreeAction {
     NewFolder,
     Rename,
     Delete,
+    Object,
+    Level,
+    Behavior,
 }
 
 struct FileDialogState {
@@ -2137,6 +2585,7 @@ struct FileDialogState {
     target: PathBuf,
     name: String,
     focused: bool,
+    kind: Option<&'static str>,
 }
 
 struct SaveProjectDialog {
@@ -2161,6 +2610,367 @@ fn project_directory_in(location: &std::path::Path, name: &str) -> Result<PathBu
 #[cfg(test)]
 mod tests {
     use super::{EditorFiles, new_project, project_directory_in, tree_form_path};
+
+    #[test]
+    fn explorer_rows_distinguish_click_double_click_and_object_drag() {
+        fn frame(
+            ctx: &egui::Context,
+            time: f64,
+            events: Vec<egui::Event>,
+            path: &std::path::Path,
+        ) -> egui::Response {
+            let mut response = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        response = Some(super::project_file_row(
+                            ui,
+                            path,
+                            "Player.altobject",
+                            false,
+                            false,
+                        ));
+                    });
+                },
+            );
+            response.unwrap()
+        }
+        fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            }
+        }
+        let ctx = egui::Context::default();
+        let path = std::path::Path::new("Player.altobject");
+        let pos = frame(&ctx, 0.0, vec![], path).rect.center();
+        frame(
+            &ctx,
+            0.1,
+            vec![egui::Event::PointerMoved(pos), button(pos, true)],
+            path,
+        );
+        let click = frame(&ctx, 0.15, vec![button(pos, false)], path);
+        assert!(click.clicked());
+        assert!(!click.double_clicked());
+        assert!(egui::DragAndDrop::payload::<std::path::PathBuf>(&ctx).is_none());
+        frame(&ctx, 0.2, vec![button(pos, true)], path);
+        let double = frame(&ctx, 0.25, vec![button(pos, false)], path);
+        assert!(double.clicked());
+        assert!(double.double_clicked());
+        frame(&ctx, 1.0, vec![button(pos, true)], path);
+        let drag = frame(
+            &ctx,
+            1.1,
+            vec![egui::Event::PointerMoved(pos + egui::vec2(40.0, 0.0))],
+            path,
+        );
+        assert!(drag.drag_started());
+        assert!(!drag.clicked());
+        assert_eq!(
+            egui::DragAndDrop::payload::<std::path::PathBuf>(&ctx)
+                .unwrap()
+                .as_path(),
+            path
+        );
+
+        let ctx = egui::Context::default();
+        let path = std::path::Path::new("Player.lua");
+        let pos = frame(&ctx, 0.0, vec![], path).rect.center();
+        frame(
+            &ctx,
+            0.1,
+            vec![egui::Event::PointerMoved(pos), button(pos, true)],
+            path,
+        );
+        assert!(frame(&ctx, 0.2, vec![button(pos, false)], path).clicked());
+        assert!(egui::DragAndDrop::payload::<std::path::PathBuf>(&ctx).is_none());
+    }
+
+    fn workspace_app() -> super::Altadra {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().to_path_buf();
+        let mut project = new_project();
+        project.manifest.name = "Test Game".into();
+        project.save(&root).unwrap();
+        project.path = None;
+        super::Altadra {
+            page: super::AppPage::Editor,
+            project,
+            recents: Default::default(),
+            recent_error: None,
+            project_name: "Test Game".into(),
+            projects_parent: None,
+            file_workspace: Some(workspace),
+            left_panel_tab: super::LeftPanelTab::Project,
+            selected_file: Some(root),
+            files: EditorFiles::default(),
+            unsaved_entries: vec![],
+            file_dialog: None,
+            save_dialog: None,
+            selected: None,
+            runtime: None,
+            textures: Default::default(),
+            dirty: true,
+            status: String::new(),
+            error: None,
+            last_tick: std::time::Instant::now(),
+            viewport_focused: false,
+        }
+    }
+
+    fn create_document(app: &mut super::Altadra, name: &str, kind: &'static str) {
+        app.apply_file_dialog(
+            super::FileDialogState {
+                action: crate::project_files::EntryAction::NewFile,
+                target: app.file_root_path().unwrap().to_path_buf(),
+                name: name.into(),
+                focused: false,
+                kind: Some(kind),
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    #[test]
+    fn custom_creation_first_save_reopen_and_save_as_work_end_to_end() {
+        use crate::documents::{Document, Instance, Overrides};
+        let mut app = workspace_app();
+        create_document(&mut app, "Player", "altobject");
+        create_document(&mut app, "Player", "lua");
+        create_document(&mut app, "Level1", "altscene");
+        assert_eq!(app.unsaved_entries.len(), 3);
+        let Document::Object(mut object) = app.read_document(&app.files.documents[0].path).unwrap()
+        else {
+            panic!("Expected object");
+        };
+        object.behavior.script = Some("Player.lua".into());
+        app.update_document(0, &Document::Object(object));
+        app.files.documents[1].contents =
+            "return function(entity, input, dt) entity.x = 777 end".into();
+        app.files.documents[1].dirty = true;
+        let Document::Level(mut level) = app.read_document(&app.files.documents[2].path).unwrap()
+        else {
+            panic!("Expected level");
+        };
+        level.instances.push(Instance {
+            id: "player".into(),
+            object: "Player.altobject".into(),
+            x: 10.0,
+            y: 20.0,
+            rotation: 0.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            overrides: Overrides::default(),
+        });
+        app.update_document(2, &Document::Level(level));
+        let mut game = app.project.manifest.clone();
+        game.starting_level = Some("Level1.altscene".into());
+        app.files.open(
+            app.file_root_path()
+                .unwrap()
+                .join(&app.project.manifest_path),
+            Document::Game(game.clone()).to_toml().unwrap(),
+        );
+        app.update_document(3, &Document::Game(game));
+        app.prepare_play(&egui::Context::default()).unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let first = destination.path().join("Game");
+        app.save_project_snapshot(first.clone()).unwrap();
+        assert!(app.file_workspace.is_none());
+        assert!(!app.has_unsaved_changes());
+        assert!(app.files.documents.iter().all(|file| file.path.exists()));
+        assert!(!first.join("scene.json").exists());
+        assert!(!first.join("assets").exists());
+        let loaded = crate::project::Project::load(&first).unwrap();
+        assert_eq!(loaded.scene.sprites.len(), 1);
+        let mut runtime = crate::runtime::Runtime::start(&loaded.scene).unwrap();
+        runtime
+            .advance(1.0 / 60.0, crate::runtime::Input::default())
+            .unwrap();
+        assert_eq!(runtime.scene.sprites[0].x, 777.0);
+        let copy = destination.path().join("Copy");
+        app.save_project_snapshot(copy.clone()).unwrap();
+        let copy_root = copy.canonicalize().unwrap();
+        assert!(
+            app.files
+                .documents
+                .iter()
+                .all(|file| file.path.starts_with(&copy_root))
+        );
+        assert!(crate::project::Project::load(&copy).is_ok());
+    }
+
+    #[test]
+    fn renaming_behavior_updates_object_buffer_and_persists_on_save() {
+        use crate::documents::Document;
+        let mut app = workspace_app();
+        create_document(&mut app, "Player", "altobject");
+        create_document(&mut app, "Player", "lua");
+        let Document::Object(mut object) = app.read_document(&app.files.documents[0].path).unwrap()
+        else {
+            panic!("Expected object");
+        };
+        object.behavior.script = Some("Player.lua".into());
+        app.update_document(0, &Document::Object(object));
+        let root = app.file_root_path().unwrap().to_path_buf();
+        app.apply_file_dialog(
+            super::FileDialogState {
+                action: crate::project_files::EntryAction::Rename,
+                target: root.join("Player.lua"),
+                name: "Movement.lua".into(),
+                focused: false,
+                kind: None,
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let Document::Object(object) = app.read_document(&root.join("Player.altobject")).unwrap()
+        else {
+            panic!("Expected object");
+        };
+        assert_eq!(object.behavior.script.as_deref(), Some("Movement.lua"));
+        assert!(app.files.documents[0].dirty);
+        assert!(!root.join("Player.lua").exists());
+        assert!(root.join("Movement.lua").exists());
+        let destination = tempfile::tempdir().unwrap();
+        app.save_project_snapshot(destination.path().join("Game"))
+            .unwrap();
+        let root = app.file_root_path().unwrap();
+        let Document::Object(object) =
+            crate::documents::load(root, &root.join("Player.altobject")).unwrap()
+        else {
+            panic!("Expected object");
+        };
+        assert_eq!(object.behavior.script.as_deref(), Some("Movement.lua"));
+    }
+
+    #[test]
+    fn typed_document_tabs_render_without_a_scene_dock() {
+        let mut app = workspace_app();
+        let ctx = egui::Context::default();
+        for (name, kind) in [
+            ("Player", "altobject"),
+            ("Level", "altscene"),
+            ("Player", "lua"),
+        ] {
+            create_document(&mut app, name, kind);
+            let output = ctx.run(egui::RawInput::default(), |ctx| {
+                app.top_bar(ctx);
+                app.left_panel(ctx);
+                app.inspector(ctx);
+                app.text_editor(ctx);
+            });
+            assert!(!output.shapes.is_empty());
+            assert!(app.error.is_none(), "{:?}", app.error);
+        }
+    }
+
+    #[test]
+    fn renaming_image_does_not_recreate_the_cached_original_on_save() {
+        use crate::documents::Document;
+        let mut app = workspace_app();
+        create_document(&mut app, "Player", "altobject");
+        let root = app.file_root_path().unwrap().to_path_buf();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(1, 1))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        crate::project_files::stage_file(&root, "Images/player.png", encoded.get_ref()).unwrap();
+        app.project
+            .assets
+            .insert("Images/player.png".into(), encoded.into_inner());
+        let Document::Object(mut object) =
+            app.read_document(&root.join("Player.altobject")).unwrap()
+        else {
+            panic!("Expected object");
+        };
+        object.appearance.image = Some("Images/player.png".into());
+        app.update_document(0, &Document::Object(object));
+        app.apply_file_dialog(
+            super::FileDialogState {
+                action: crate::project_files::EntryAction::Rename,
+                target: root.join("Images").join("player.png"),
+                name: "hero.png".into(),
+                focused: false,
+                kind: None,
+            },
+            &egui::Context::default(),
+        );
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let destination = tempfile::tempdir().unwrap();
+        let saved = destination.path().join("Game");
+        app.save_project_snapshot(saved.clone()).unwrap();
+        assert!(saved.join("Images").join("hero.png").exists());
+        assert!(!saved.join("Images").join("player.png").exists());
+        let Document::Object(object) =
+            crate::documents::load(&saved, &saved.join("Player.altobject")).unwrap()
+        else {
+            panic!("Expected object");
+        };
+        assert_eq!(object.appearance.image.as_deref(), Some("Images/hero.png"));
+    }
+
+    #[test]
+    fn runtime_snapshot_uses_unsaved_object_and_behavior_tabs() {
+        use crate::documents::{Document, Instance, LevelDocument, ObjectDocument, Overrides};
+        let root = tempfile::tempdir().unwrap();
+        let object_path = root.path().join("Player.altobject");
+        let script_path = root.path().join("Player.lua");
+        let mut object = ObjectDocument::new("Player");
+        object.behavior.script = Some("Player.lua".into());
+        std::fs::write(
+            &object_path,
+            Document::Object(object.clone()).to_toml().unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&script_path, "return function(entity, input, dt) end").unwrap();
+        let mut files = EditorFiles::default();
+        object.appearance.width = 123.0;
+        files.open(object_path, Document::Object(object).to_toml().unwrap());
+        files.documents[0].dirty = true;
+        files.open(
+            script_path,
+            "return function(entity, input, dt) entity.x = 456 end".into(),
+        );
+        files.documents[1].dirty = true;
+        let level = LevelDocument {
+            version: 1,
+            name: "Level".into(),
+            instances: vec![Instance {
+                id: "player".into(),
+                object: "Player.altobject".into(),
+                x: 0.0,
+                y: 0.0,
+                rotation: 0.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                overrides: Overrides::default(),
+            }],
+        };
+        let scene = crate::documents::resolve_level(
+            root.path(),
+            &level,
+            |path| files.read_document(root.path(), path),
+            |path| files.read_script(root.path(), path),
+        )
+        .unwrap();
+        assert_eq!(scene.sprites[0].width, 123.0);
+        let mut runtime = crate::runtime::Runtime::start(&scene).unwrap();
+        runtime
+            .advance(1.0 / 60.0, crate::runtime::Input::default())
+            .unwrap();
+        assert_eq!(runtime.scene.sprites[0].x, 456.0);
+        assert!(files.documents.iter().all(|file| file.dirty));
+    }
 
     #[test]
     fn previews_replace_only_clean_preview_tabs() {

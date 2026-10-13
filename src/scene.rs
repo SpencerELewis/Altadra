@@ -74,7 +74,7 @@ impl Sprite {
             return Err("Lua scripts are limited to 64 KB.".into());
         }
         if let Some(asset) = &self.asset {
-            crate::project::validate_asset_name(asset)?;
+            crate::documents::validate_image_reference(asset)?;
         }
         Ok(())
     }

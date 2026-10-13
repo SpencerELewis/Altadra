@@ -38,7 +38,9 @@ subsystem, so it does not open an extra console window.
   first save (from the toolbar or when exiting) opens a **Save project** dialog:
   enter the project name and choose a location, and Altadra creates the project
   folder `<location>\<name>` inside it.
-- **Open / import project** selects an existing folder containing `scene.json`.
+- **Open / import project** selects an existing folder containing one `.altgame`
+  project settings file. Legacy folders containing `scene.json` prompt for
+  conversion; original files are retained and conflicting outputs are rejected.
   This opens projects in place without changing or
   copying their existing data.
 - The Home page lists up to 12 recently opened projects. Open one directly, remove
@@ -48,21 +50,23 @@ subsystem, so it does not open an extra console window.
   confirmation. Exiting an unsaved project or a project with recent edits asks
   whether to save, discard, or cancel. Existing projects save to their current
   folder; new projects open the Save project dialog.
-- New projects contain no sample sprites or assets. Add sprites from the Scene
-  tab, and import PNG assets from files anywhere on your computer.
+- New projects contain project settings, but no sample objects, levels, or assets.
+  Use **+ > New Object**, **New Level**, or **New Behavior** to create custom
+  files with valid initial contents. Names are entered inline; their extensions
+  are added automatically. Ordinary New File and New Folder remain available.
 - The editor's left dock opens to the **Project** tab, which shows the active
   project's files and folders directly; the project folder itself is not a tree
   row, and its name is shown as the panel header next to the **+** menu. Unsaved
   items are shown in yellow with a trailing `*` (every item in a never-saved
   project, newly created files and folders until the next save, open text
-  files with unsaved edits and their parent folders, and `scene.json` when the
-  scene has unsaved changes); they return to normal once saved. As in VS Code,
+  files with unsaved edits and their parent folders); they return to normal once
+  saved. As in VS Code,
   new files and folders are created on disk immediately; the marker shows they
   have not been saved yet. Create files and folders, rename or delete selected
   entries, and click UTF-8 text files to edit them. Text edits are limited to
   1 MB and save from the file editor or project Save button. Unsaved projects
   keep files in a temporary workspace and copy them into the chosen project
-  folder when saved. `scene.json` remains managed by the scene editor; binary
+  folder when saved. The project settings filename is managed by Altadra; binary
   assets can be imported from anywhere. Use the **+** menu or right-click the
   project root, a folder, or a file to create items; a name field appears inline
   in the tree where the item will be added (press **Enter** to create, **Esc** to
@@ -70,7 +74,7 @@ subsystem, so it does not open an extra console window.
   delete it; files only offer **New File** (no New Folder). Select a file or
   folder and press **Delete** to
   remove it (with confirmation). Selected sprites have a bright outline in the
-  viewport. Switch to **Scene** for the sprite hierarchy and controls.
+  viewport. Levels are ordinary document tabs, not a separate Scene dock.
 - Open text files appear as tabs across the top of the file editor. Click a tab
   to switch without losing unsaved edits; opening the same file again selects
   its existing tab. Each tab has an **x** to close it; closing an edited file
@@ -81,13 +85,22 @@ subsystem, so it does not open an extra console window.
 - Single-clicking a file opens an italic preview tab; opening another preview
   replaces it. Double-click a file or its tab to keep it open. Editing a preview
   also keeps it open automatically; unsaved edits are never replaced.
-- Edit name, position, rotation, scale, size, tint, visibility, velocity, and each
-  sprite's Lua script in the inspector.
+- Object tabs edit reusable appearance and velocity defaults, PNG references, and
+  external Lua behavior references in Properties. Level tabs show a placement
+  canvas and an instance list in Properties. Add objects using the object picker
+  or drag `.altobject` files from the explorer onto the canvas. Select and drag
+  instances to move them; Properties also supports transforms, duplication,
+  deletion, optional overrides, and resetting overrides to object defaults.
+- Project tabs select the starting level. PNG tabs preview artwork. Invalid custom
+  documents show an error; **Edit TOML source** allows inspection and repair.
+- Renaming project files updates referencing documents and marks them unsaved;
+  deleting referenced items warns which documents will have broken references.
 - Click sprites to select them in the viewport. Rotation and scale are used for
   rendering and rectangle picking. The scene origin is centered; +X is right,
   +Y is down; the last sprite draws on top.
-- Import PNG files. Images are copied into the project on save. They can be tinted
-  in the inspector. Without an imported image, sprites render as solid-color quads.
+- Import PNG files to copy artwork into the project. If an object tab is active,
+  the imported image is assigned to it. Objects without an image render as
+  solid-color rectangles.
 - **File** in the top bar contains **New**, **Open**, **Save**, and **Save As**,
   which operate on project directories. Save As uses the
   same Save project dialog: the chosen folder is the location, and a new project
@@ -95,13 +108,15 @@ subsystem, so it does not open an extra console window.
   overwritten). Unsaved changes require confirmation. Press **Ctrl+S** to save
   the project (and all open text files); unsaved new projects open the Save
   project dialog.
-- Play runs a fixed 60 Hz clone of the authoring scene. Click the viewport and use
+- Play runs the active level, or the project's configured starting level when
+  another file is active. Unsaved object, level, and Lua buffers are included in
+  the runtime snapshot. Play runs a fixed 60 Hz clone; click the viewport and use
   WASD or arrow keys; Stop discards runtime changes and preserves the authored scene.
 - Script/runtime, file, and image errors are shown in the editor status area.
 
 ## Lua scripts
 
-Each sprite has a Lua script which returns a function:
+An object can reference a `.lua` behavior file which returns a function:
 
 ```lua
 return function(entity, input, dt)
@@ -115,8 +130,8 @@ end
 
 `entity` exposes mutable `x`, `y`, `vx`, and `vy`, plus read-only-by-convention
 `width` and `height`. `input` exposes `left`, `right`, `up`, `down`, `x`, and `y`.
-`dt` is the fixed 1/60-second step. Scripts are stored in the scene JSON and run
-only in Play mode. Base `os`, `io`, and `debug` Lua libraries are not enabled.
+`dt` is the fixed 1/60-second step. Behavior files run only in Play mode.
+Base `os`, `io`, and `debug` Lua libraries are not enabled.
 Each invocation is limited to 100,000 Lua instructions and the runtime has a
 64 MiB Lua memory budget; non-finite outputs and runtime errors stop play with
 an explicit error. Lua scripts do not yet have
@@ -124,27 +139,57 @@ asset, audio, scene-transition, or entity-creation APIs.
 
 ## Project format
 
+Custom files use versioned TOML. The root has one `.altgame` manifest; other files
+can be organized in ordinary folders. References use project-relative `/`
+separators on disk so projects remain portable.
+
 ```text
 MyGame\
-  scene.json
+  game.altgame
+  Player.altobject
+  Player.lua
+  Level1.altscene
   assets\          (created only when PNG images are imported)
     <sha256>.png
 ```
 
-Versioned JSON stores sprite transforms, tint, velocity, and Lua source. Imported
-PNG files are content-addressed under `assets/` and use relative references, so
-projects can be copied or moved. Scene JSON is limited to 16 MB, sprites to
-10,000 per scene, PNG files to 64 MB, and image dimensions to 4096 x 4096.
-Path traversal and symlink paths are rejected. Save writes the updated scene
-through a temporary file after copying referenced images.
+`.altgame` stores the project name and optional `starting_level`. `.altobject`
+stores `appearance`, `behavior`, and `motion` sections. `.altscene` stores
+`[[instances]]` with unique IDs, object references, position/rotation/scale, and
+optional `overrides`. Multiple instances share object defaults; an explicit
+override affects only that instance.
+
+```toml
+# Player.altobject
+version = 1
+name = "Player"
+
+[appearance]
+width = 32
+height = 48
+tint = [255, 255, 255, 255]
+visible = true
+
+[behavior]
+script = "Player.lua"
+
+[motion]
+vx = 0
+vy = 0
+```
+
+TOML/text files are limited to 1 MB, Lua behaviors to 64 KB, instances to 10,000
+per level, PNG files to 64 MB, and image dimensions to 4096 x 4096. Unknown fields
+and unsupported versions are rejected. Path traversal and symlinks are rejected;
+text saves are atomic. Legacy migration keeps the old JSON and asset files.
 
 ## Tests and CI
 
 ```powershell
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
 ```
 
 Windows CI runs formatting, tests, Clippy, and release builds. Architecture notes,

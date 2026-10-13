@@ -49,9 +49,9 @@ impl RecentProjects {
         let path = path
             .canonicalize()
             .map_err(|e| format!("Could not resolve project path: {e}"))?;
-        if !path.join("scene.json").is_file() {
+        if !crate::project::Project::is_project_folder(&path) {
             return Err(format!(
-                "Cannot add '{}' to recent projects: scene.json is missing.",
+                "Cannot add '{}' to recent projects: no .altgame manifest or scene.json was found.",
                 path.display()
             ));
         }

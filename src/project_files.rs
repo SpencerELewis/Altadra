@@ -155,6 +155,97 @@ pub fn write_text_file(root: &Path, file: &Path, contents: &str) -> Result<(), S
     Ok(())
 }
 
+/// Creates `parent/name` (which must not exist) with `contents`; the new file is
+/// removed again if writing fails.
+pub fn create_text_file(
+    root: &Path,
+    parent: &Path,
+    name: &str,
+    contents: &str,
+) -> Result<PathBuf, String> {
+    if contents.len() as u64 > MAX_TEXT_FILE_SIZE {
+        return Err("Text files are limited to 1 MB.".into());
+    }
+    let file = create_file(root, parent, name)?;
+    if let Err(error) = write_text_file(root, &file, contents) {
+        let _ = fs::remove_file(&file);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Reads a regular file inside the project (no symlinks), refusing files larger
+/// than `max_bytes`.
+pub fn read_binary_file(root: &Path, file: &Path, max_bytes: u64) -> Result<Vec<u8>, String> {
+    let file = checked_path(root, file, false)?;
+    let metadata = fs::metadata(&file).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("Select a file to open.".into());
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "Files larger than {max_bytes} bytes cannot be opened."
+        ));
+    }
+    let bytes = fs::read(&file).map_err(|error| format!("Could not read file: {error}"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "Files larger than {max_bytes} bytes cannot be opened."
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Reads and fully validates a project PNG (≤ 64 MB, ≤ 4096 × 4096, decodable).
+pub fn read_png(root: &Path, file: &Path) -> Result<Vec<u8>, String> {
+    let bytes = read_binary_file(root, file, crate::project::MAX_PNG_BYTES)?;
+    crate::project::validate_png(&bytes)?;
+    Ok(bytes)
+}
+
+/// Writes binary `contents` at a `/`-separated project-relative path, creating
+/// missing folders. An existing identical file is left alone; a different one
+/// is an error.
+pub fn stage_file(root: &Path, relative: &str, contents: &[u8]) -> Result<PathBuf, String> {
+    let components: Vec<&str> = relative.split('/').collect();
+    let Some((file_name, folders)) = components.split_last() else {
+        return Err("Invalid project path.".into());
+    };
+    for component in &components {
+        validate_entry_name(component)?;
+    }
+    let mut parent = checked_path(root, root, true)?;
+    for folder in folders {
+        let next = parent.join(folder);
+        parent = if next.exists() {
+            let next = checked_path(root, &next, false)?;
+            if !next.is_dir() {
+                return Err(format!("'{}' is not a folder.", next.display()));
+            }
+            next
+        } else {
+            create_folder(root, &parent, folder)?
+        };
+    }
+    let file = parent.join(file_name);
+    if file.exists() {
+        let file = checked_path(root, &file, false)?;
+        let existing = fs::read(&file).map_err(|error| format!("Could not read file: {error}"))?;
+        if existing != contents {
+            return Err(format!(
+                "'{relative}' already exists with different contents."
+            ));
+        }
+        return Ok(file);
+    }
+    let file = create_file(root, &parent, file_name)?;
+    if let Err(error) = fs::write(&file, contents) {
+        let _ = fs::remove_file(&file);
+        return Err(format!("Could not save '{relative}': {error}"));
+    }
+    Ok(file)
+}
+
 pub fn stage_asset_file(root: &Path, asset_name: &str, contents: &[u8]) -> Result<(), String> {
     crate::project::validate_asset_name(asset_name)?;
     let parent = root.join("assets");
@@ -223,13 +314,11 @@ fn copy_directory_contents(
         let relative = source_path
             .strip_prefix(workspace)
             .map_err(|_| "Temporary project files are outside their workspace.".to_owned())?;
-        if relative
-            .to_string_lossy()
-            .eq_ignore_ascii_case("scene.json")
-        {
+        let target_path = destination.join(relative);
+        if is_managed_root_file(relative) && target_path.exists() {
+            // Already written by Project::save, which is authoritative.
             continue;
         }
-        let target_path = destination.join(relative);
         if file_type.is_dir() {
             fs::create_dir_all(&target_path).map_err(|error| {
                 format!("Could not create '{}': {error}", target_path.display())
@@ -262,6 +351,17 @@ fn copy_directory_contents(
         }
     }
     Ok(())
+}
+
+/// Root `scene.json` and `*.altgame` manifests are written by `Project::save`.
+fn is_managed_root_file(relative: &Path) -> bool {
+    let mut components = relative.components();
+    let (Some(std::path::Component::Normal(name)), None) = (components.next(), components.next())
+    else {
+        return false;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    name == "scene.json" || name.ends_with(".altgame")
 }
 
 fn ensure_managed_scene_is_unchanged(root: &Path, entry: &Path) -> Result<(), String> {
@@ -377,12 +477,8 @@ mod tests {
         stage_asset_file(workspace.path(), "assets/0123abcd.png", b"asset bytes").unwrap();
 
         let mut project = crate::project::Project {
-            scene: crate::scene::Scene {
-                version: 1,
-                sprites: Vec::new(),
-            },
-            path: None,
-            assets: Default::default(),
+            format: crate::project::ProjectFormat::Legacy,
+            ..Default::default()
         };
         project.save(destination.path()).unwrap();
         copy_workspace_files(workspace.path(), destination.path()).unwrap();
@@ -403,12 +499,8 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
         let mut project = crate::project::Project {
-            scene: crate::scene::Scene {
-                version: 1,
-                sprites: Vec::new(),
-            },
-            path: None,
-            assets: Default::default(),
+            format: crate::project::ProjectFormat::Legacy,
+            ..Default::default()
         };
         project.save(source.path()).unwrap();
         fs::write(source.path().join("notes.txt"), "project notes").unwrap();
@@ -421,5 +513,61 @@ mod tests {
             fs::read_to_string(destination.path().join("notes.txt")).unwrap(),
             "project notes"
         );
+    }
+
+    #[test]
+    fn new_manifest_projects_copy_files_without_replacing_saved_manifest() {
+        let workspace = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let mut project = crate::project::Project::default();
+        project.save(workspace.path()).unwrap();
+        project.manifest.name = "Renamed".into();
+        fs::write(workspace.path().join("scene.json"), "{}").unwrap();
+        create_text_file(workspace.path(), workspace.path(), "a.lua", "-- lua").unwrap();
+        project.save(destination.path()).unwrap();
+
+        copy_workspace_files(workspace.path(), destination.path()).unwrap();
+
+        let manifest = fs::read_to_string(destination.path().join("game.altgame")).unwrap();
+        assert!(manifest.contains("Renamed"));
+        // Leftover legacy files of manifest projects are copied, not dropped.
+        assert_eq!(
+            fs::read_to_string(destination.path().join("scene.json")).unwrap(),
+            "{}"
+        );
+        assert!(destination.path().join("a.lua").is_file());
+    }
+
+    #[test]
+    fn binary_and_png_reads_are_sandboxed_and_limited() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let file = stage_file(root, "Art/Sub/data.bin", &[1, 2, 3]).unwrap();
+        assert_eq!(read_binary_file(root, &file, 3).unwrap(), vec![1, 2, 3]);
+        assert!(read_binary_file(root, &file, 2).is_err());
+        assert!(read_binary_file(root, root, 10).is_err());
+        assert!(stage_file(root, "Art/Sub/data.bin", &[1, 2, 3]).is_ok());
+        assert!(stage_file(root, "Art/Sub/data.bin", &[9]).is_err());
+        assert!(stage_file(root, "../escape.bin", &[1]).is_err());
+        assert!(stage_file(root, "a//b.bin", &[1]).is_err());
+        assert!(read_png(root, &file).is_err());
+
+        let outside = tempfile::tempdir().unwrap();
+        let escaped = outside.path().join("x.bin");
+        fs::write(&escaped, [1]).unwrap();
+        assert!(read_binary_file(root, &escaped, 10).is_err());
+        assert!(read_binary_file(root, &root.join("..").join("x.bin"), 10).is_err());
+    }
+
+    #[test]
+    fn create_text_file_rolls_back_and_refuses_existing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let file = create_text_file(root, root, "a.altobject", "name = 'x'").unwrap();
+        assert_eq!(read_text_file(root, &file).unwrap(), "name = 'x'");
+        assert!(create_text_file(root, root, "a.altobject", "").is_err());
+        let huge = "x".repeat(MAX_TEXT_FILE_SIZE as usize + 1);
+        assert!(create_text_file(root, root, "huge.txt", &huge).is_err());
+        assert!(!root.join("huge.txt").exists());
     }
 }
