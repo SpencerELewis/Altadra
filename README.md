@@ -34,7 +34,7 @@ subsystem, so it does not open an extra console window.
 ## Editor
 
 - The app opens to **Home**. Name a project and select **Create project** to open
-  an unsaved starter scene; choosing a save location up front is optional. Save
+  an unsaved, empty project; choosing a save location up front is optional. Save
   from the editor toolbar, or choose **Save** when exiting to choose a location.
 - **Open / import project** selects an existing folder containing `scene.json`
   and its `assets` folder. This opens projects in place without changing or
@@ -46,8 +46,8 @@ subsystem, so it does not open an extra console window.
   confirmation. Exiting an unsaved project or a project with recent edits asks
   whether to save, discard, or cancel. Existing projects save to their current
   folder; new projects use the chosen parent folder and project name.
-- Start with an example scene containing a Lua-controlled player, a moving sprite,
-  and a platform. Add, select, and delete sprites in the scene panel.
+- New projects contain no sample sprites or assets. Add sprites from the Scene
+  tab, and import PNG assets from files anywhere on your computer.
 - The editor's left dock opens to the **Project** tab, which shows the active
   project's folder tree. Switch to **Scene** for the sprite hierarchy and controls.
 - Edit name, position, rotation, scale, size, tint, visibility, velocity, and each

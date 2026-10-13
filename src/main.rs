@@ -53,8 +53,12 @@ struct Altadra {
 impl Altadra {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let project = starter_project();
-        let player = project.scene.sprites[0].id.clone();
+        let project = new_project();
+        let selected = project
+            .scene
+            .sprites
+            .first()
+            .map(|sprite| sprite.id.clone());
         let (recents, recent_error) = match RecentProjects::load() {
             Ok(recents) => (recents, None),
             Err(error) => (RecentProjects::default(), Some(error)),
@@ -68,7 +72,7 @@ impl Altadra {
             projects_parent: None,
             left_panel_tab: LeftPanelTab::Project,
             selected_file: None,
-            selected: Some(player),
+            selected,
             runtime: None,
             textures: Default::default(),
             dirty: false,
@@ -146,9 +150,9 @@ impl Altadra {
             self.error = Some(error);
             return;
         }
-        self.activate_project(starter_project(), ctx);
+        self.activate_project(new_project(), ctx);
         self.dirty = true;
-        self.status = "New project is unsaved. Save it from the toolbar or when exiting.".into();
+        self.status = "New project is empty and unsaved. Add content, then save it from the toolbar or when exiting.".into();
     }
 
     fn open_project(&mut self, path: &std::path::Path, ctx: &egui::Context) {
@@ -664,6 +668,9 @@ impl Altadra {
                         ui.heading("Scene");
                         let sprites = &self.project.scene.sprites;
                         let selected = self.selected.clone();
+                        if sprites.is_empty() {
+                            ui.label("This scene is empty. Add a sprite to get started.");
+                        }
                         for sprite in sprites {
                             let label = format!("▰  {}", sprite.name);
                             if ui
@@ -1056,19 +1063,15 @@ fn render_project_tree(
     }
 }
 
-fn starter_project() -> Project {
-    let mut project = Project::default();
-    if let Some(player) = project.scene.sprites.first_mut() {
-        player.script = r#"return function(entity, input, dt)
-    local speed = 180
-    if input.left then entity.x = entity.x - speed * dt end
-    if input.right then entity.x = entity.x + speed * dt end
-    if input.up then entity.y = entity.y - speed * dt end
-    if input.down then entity.y = entity.y + speed * dt end
-end"#
-            .into();
+fn new_project() -> Project {
+    Project {
+        scene: Scene {
+            version: 1,
+            sprites: Vec::new(),
+        },
+        path: None,
+        assets: Default::default(),
     }
-    project
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1078,4 +1081,18 @@ enum FileAction {
     Save,
     SaveAs,
     Import,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_project;
+
+    #[test]
+    fn new_project_starts_without_sample_sprites_or_files() {
+        let project = new_project();
+
+        assert!(project.path.is_none());
+        assert!(project.scene.sprites.is_empty());
+        assert!(project.assets.is_empty());
+    }
 }
