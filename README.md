@@ -38,8 +38,8 @@ subsystem, so it does not open an extra console window.
   first save (from the toolbar or when exiting) opens a **Save project** dialog:
   enter the project name and choose a location, and Altadra creates the project
   folder `<location>\<name>` inside it.
-- **Open / import project** selects an existing folder containing `scene.json`
-  and its `assets` folder. This opens projects in place without changing or
+- **Open / import project** selects an existing folder containing `scene.json`.
+  This opens projects in place without changing or
   copying their existing data.
 - The Home page lists up to 12 recently opened projects. Open one directly, remove
   an entry, or clear the list. Recent projects are stored in your user application
@@ -51,7 +51,8 @@ subsystem, so it does not open an extra console window.
 - New projects contain no sample sprites or assets. Add sprites from the Scene
   tab, and import PNG assets from files anywhere on your computer.
 - The editor's left dock opens to the **Project** tab, which shows the active
-  project's folder tree. Create files and folders, rename or delete selected
+  project's files and folders directly; the project folder itself is not a tree
+  row, and its name is shown as the panel header next to the **+** menu. Create files and folders, rename or delete selected
   entries, and click UTF-8 text files to edit them. Text edits are limited to
   1 MB and save from the file editor or project Save button. Unsaved projects
   keep files in a temporary workspace and copy them into the chosen project
@@ -74,7 +75,9 @@ subsystem, so it does not open an extra console window.
 - New, Open, Save, and Save As operate on project directories. Save As uses the
   same Save project dialog: the chosen folder is the location, and a new project
   folder with the given name is created inside it (existing folders are never
-  overwritten). Unsaved changes require confirmation.
+  overwritten). Unsaved changes require confirmation. Press **Ctrl+S** to save
+  the project (and any open text file); unsaved new projects open the Save
+  project dialog.
 - Play runs a fixed 60 Hz clone of the authoring scene. Click the viewport and use
   WASD or arrow keys; Stop discards runtime changes and preserves the authored scene.
 - Script/runtime, file, and image errors are shown in the editor status area.
@@ -107,7 +110,7 @@ asset, audio, scene-transition, or entity-creation APIs.
 ```text
 MyGame\
   scene.json
-  assets\
+  assets\          (created only when PNG images are imported)
     <sha256>.png
 ```
 

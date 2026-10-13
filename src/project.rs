@@ -155,7 +155,6 @@ impl Project {
         if assets_dir.exists() {
             reject_symlink(&assets_dir)?;
         }
-        fs::create_dir_all(&assets_dir).map_err(|e| e.to_string())?;
         for name in self
             .scene
             .sprites
@@ -178,6 +177,7 @@ impl Project {
                     ));
                 }
             } else {
+                fs::create_dir_all(&assets_dir).map_err(|e| e.to_string())?;
                 fs::write(path, bytes)
                     .map_err(|e| format!("Could not save image '{name}': {e}"))?;
             }
@@ -274,6 +274,16 @@ mod tests {
         loaded.save(&temporary.path().join("copy")).unwrap();
         let copied = Project::load(&temporary.path().join("copy")).unwrap();
         assert_eq!(project.scene.sprites.len(), copied.scene.sprites.len());
+    }
+
+    #[test]
+    fn saving_without_images_does_not_create_assets_folder() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut project = Project::default();
+        project.save(&temporary.path().join("game")).unwrap();
+        assert!(temporary.path().join("game").join("scene.json").exists());
+        assert!(!temporary.path().join("game").join("assets").exists());
+        assert!(Project::load(&temporary.path().join("game")).is_ok());
     }
 
     #[test]

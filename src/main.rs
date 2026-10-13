@@ -1123,22 +1123,43 @@ impl Altadra {
                                     .to_string_lossy()
                                     .into_owned()
                             };
-                            ui.label(egui::RichText::new(&root_name).strong())
-                                .on_hover_text(root.display().to_string());
                             let mut create_file = false;
                             let mut create_folder = false;
                             let mut context_action = None;
-                            ui.horizontal_wrapped(|ui| {
-                                ui.menu_button("+  ▾", |ui| {
-                                    if ui.button("New File").clicked() {
-                                        create_file = true;
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("New Folder").clicked() {
-                                        create_folder = true;
-                                        ui.close_menu();
-                                    }
-                                });
+                            ui.horizontal(|ui| {
+                                let header = ui
+                                    .add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&root_name).strong().size(13.0),
+                                        )
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text(root.display().to_string());
+                                if header.clicked() {
+                                    self.selected_file = Some(root.clone());
+                                }
+                                response_context_menu(
+                                    &header,
+                                    &root,
+                                    TreeEntryKind::Root,
+                                    &mut context_action,
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.menu_button("+  ▾", |ui| {
+                                            if ui.button("New File").clicked() {
+                                                create_file = true;
+                                                ui.close_menu();
+                                            }
+                                            if ui.button("New Folder").clicked() {
+                                                create_folder = true;
+                                                ui.close_menu();
+                                            }
+                                        });
+                                    },
+                                );
                             });
                             if create_file {
                                 self.begin_file_dialog(project_files::EntryAction::NewFile);
@@ -1151,43 +1172,15 @@ impl Altadra {
                             let mut clicked_file = None;
                             let mut inline_outcome = None;
                             egui::ScrollArea::vertical().show(ui, |ui| {
-                                let mut root_state =
-                                    egui::collapsing_header::CollapsingState::load_with_default_open(
-                                        ui.ctx(),
-                                        ui.make_persistent_id(&root),
-                                        true,
-                                    );
-                                if inline_create_target(&self.file_dialog).is_some() {
-                                    root_state.set_open(true);
-                                }
-                                let (_, header_label, _) = root_state
-                                    .show_header(ui, |ui| {
-                                        let response = ui.selectable_label(
-                                            self.selected_file.as_ref() == Some(&root),
-                                            format!("📁 {root_name}"),
-                                        );
-                                        if response.clicked() {
-                                            self.selected_file = Some(root.clone());
-                                        }
-                                        response
-                                    })
-                                    .body(|ui| {
-                                        let mut tree = TreeContext {
-                                            selected_file: &mut self.selected_file,
-                                            clicked_file: &mut clicked_file,
-                                            context_action: &mut context_action,
-                                            errors: &mut errors,
-                                            inline_create: &mut self.file_dialog,
-                                            inline_outcome: &mut inline_outcome,
-                                        };
-                                        render_project_tree(ui, &root, &mut tree);
-                                    });
-                                response_context_menu(
-                                    &header_label.inner,
-                                    &root,
-                                    TreeEntryKind::Root,
-                                    &mut context_action,
-                                );
+                                let mut tree = TreeContext {
+                                    selected_file: &mut self.selected_file,
+                                    clicked_file: &mut clicked_file,
+                                    context_action: &mut context_action,
+                                    errors: &mut errors,
+                                    inline_create: &mut self.file_dialog,
+                                    inline_outcome: &mut inline_outcome,
+                                };
+                                render_project_tree(ui, &root, &mut tree);
                                 let blank_space = ui.allocate_response(
                                     Vec2::new(
                                         ui.available_width(),
@@ -1195,6 +1188,10 @@ impl Altadra {
                                     ),
                                     egui::Sense::click(),
                                 );
+                                // Clicking empty space targets the project folder itself.
+                                if blank_space.clicked() || blank_space.secondary_clicked() {
+                                    self.selected_file = Some(root.clone());
+                                }
                                 response_context_menu(
                                     &blank_space,
                                     &root,
@@ -1214,7 +1211,9 @@ impl Altadra {
                             for error in errors {
                                 ui.colored_label(Color32::LIGHT_RED, error);
                             }
-                            if let Some(path) = &self.selected_file {
+                            if let Some(path) =
+                                self.selected_file.as_ref().filter(|path| **path != root)
+                            {
                                 ui.separator();
                                 ui.label(
                                     path.strip_prefix(&root)
@@ -1594,6 +1593,17 @@ impl eframe::App for Altadra {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
         self.handle_project_delete_key(ctx);
+        if self.page == AppPage::Editor
+            && self.save_dialog.is_none()
+            && ctx.input_mut(|input| {
+                input.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::COMMAND,
+                    egui::Key::S,
+                ))
+            })
+        {
+            self.file_action(FileAction::Save, ctx);
+        }
         if self.page == AppPage::Editor {
             self.update_play(ctx);
         }
