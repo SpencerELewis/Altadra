@@ -45,6 +45,7 @@ struct Altadra {
     open_text_file: Option<PathBuf>,
     text_buffer: String,
     text_file_dirty: bool,
+    unsaved_entries: Vec<PathBuf>,
     file_dialog: Option<FileDialogState>,
     save_dialog: Option<SaveProjectDialog>,
     selected: Option<String>,
@@ -83,6 +84,7 @@ impl Altadra {
             open_text_file: None,
             text_buffer: String::new(),
             text_file_dirty: false,
+            unsaved_entries: Vec::new(),
             file_dialog: None,
             save_dialog: None,
             selected,
@@ -245,6 +247,7 @@ impl Altadra {
         self.open_text_file = None;
         self.text_buffer.clear();
         self.text_file_dirty = false;
+        self.unsaved_entries.clear();
         self.file_dialog = None;
         self.save_dialog = None;
         self.selected = self
@@ -316,6 +319,7 @@ impl Altadra {
         self.open_text_file = None;
         self.text_buffer.clear();
         self.text_file_dirty = false;
+        self.unsaved_entries.clear();
         self.save_dialog = None;
         self.page = AppPage::Home;
         self.error = None;
@@ -494,8 +498,12 @@ impl Altadra {
             });
     }
 
+    fn has_unsaved_changes(&self) -> bool {
+        self.dirty || self.text_file_dirty || !self.unsaved_entries.is_empty()
+    }
+
     fn confirm_discard(&self) -> bool {
-        !(self.dirty || self.text_file_dirty)
+        !self.has_unsaved_changes()
             || rfd::MessageDialog::new()
                 .set_title("Unsaved changes")
                 .set_description("Discard unsaved project and file changes?")
@@ -507,7 +515,7 @@ impl Altadra {
 
     fn handle_close_request(&mut self, ctx: &egui::Context) {
         if self.page != AppPage::Editor
-            || !(self.dirty || self.text_file_dirty || self.project.path.is_none())
+            || !(self.has_unsaved_changes() || self.project.path.is_none())
             || !ctx.input(|input| input.viewport().close_requested())
         {
             return;
@@ -602,6 +610,7 @@ impl Altadra {
         }
         self.selected_file = self.project.path.clone();
         self.dirty = false;
+        self.unsaved_entries.clear();
         self.status = format!("Saved {}", directory.display());
         self.remember_project(&directory);
         Ok(())
@@ -609,6 +618,10 @@ impl Altadra {
 
     fn save_open_text_file(&mut self) -> Result<(), String> {
         if !self.text_file_dirty {
+            // Saving an unmodified new file still counts as its first save.
+            if let Some(file) = &self.open_text_file {
+                self.unsaved_entries.retain(|entry| entry != file);
+            }
             return Ok(());
         }
         if self.runtime.is_some() {
@@ -622,6 +635,8 @@ impl Altadra {
             .as_deref()
             .ok_or_else(|| "No text file is open.".to_owned())?;
         project_files::write_text_file(root, file, &self.text_buffer)?;
+        let file = file.to_path_buf();
+        self.unsaved_entries.retain(|entry| *entry != file);
         self.text_file_dirty = false;
         self.status = format!("Saved {}", file.display());
         self.error = None;
@@ -808,6 +823,17 @@ impl Altadra {
         };
         match result {
             Ok(path) => {
+                let path = tree_form_path(&root, path);
+                if dialog.action == project_files::EntryAction::Rename {
+                    let old_path = &dialog.target;
+                    for entry in &mut self.unsaved_entries {
+                        if let Ok(relative) = entry.strip_prefix(old_path) {
+                            *entry = path.join(relative);
+                        }
+                    }
+                } else {
+                    self.unsaved_entries.push(path.clone());
+                }
                 self.selected_file = Some(path.clone());
                 self.error = None;
                 if dialog.action == project_files::EntryAction::NewFile {
@@ -910,6 +936,8 @@ impl Altadra {
                     self.text_buffer.clear();
                     self.text_file_dirty = false;
                 }
+                self.unsaved_entries
+                    .retain(|unsaved| !unsaved.starts_with(&entry));
                 self.selected_file = Some(root);
                 self.status = format!("Removed {}", entry.display());
                 self.error = None;
@@ -1081,7 +1109,7 @@ impl Altadra {
                     self.status = "Stopped. Authoring scene and saved state are unchanged.".into();
                     self.error = None;
                 }
-                ui.label(if self.dirty || self.text_file_dirty {
+                ui.label(if self.has_unsaved_changes() {
                     "● Unsaved changes"
                 } else {
                     "Saved"
@@ -1116,13 +1144,24 @@ impl Altadra {
                     LeftPanelTab::Project => {
                         if let Some(root) = self.file_root_path().map(PathBuf::from) {
                             let root_name = if self.project.path.is_none() {
-                                format!("{} (unsaved)", self.project_name.trim())
+                                self.project_name.trim().to_owned()
                             } else {
                                 root.file_name()
                                     .unwrap_or(root.as_os_str())
                                     .to_string_lossy()
                                     .into_owned()
                             };
+                            let all_unsaved = self.file_workspace.is_some();
+                            let mut dirty_paths = self.unsaved_entries.clone();
+                            if self.text_file_dirty
+                                && let Some(path) = &self.open_text_file
+                            {
+                                dirty_paths.push(path.clone());
+                            }
+                            if self.dirty {
+                                dirty_paths.push(root.join("scene.json"));
+                            }
+                            let project_unsaved = all_unsaved || !dirty_paths.is_empty();
                             let mut create_file = false;
                             let mut create_folder = false;
                             let mut context_action = None;
@@ -1130,12 +1169,18 @@ impl Altadra {
                                 let header = ui
                                     .add(
                                         egui::Label::new(
-                                            egui::RichText::new(&root_name).strong().size(13.0),
+                                            unsaved_text(&root_name, project_unsaved)
+                                                .strong()
+                                                .size(13.0),
                                         )
                                         .truncate()
                                         .sense(egui::Sense::click()),
                                     )
-                                    .on_hover_text(root.display().to_string());
+                                    .on_hover_text(if project_unsaved {
+                                        format!("{} (unsaved changes)", root.display())
+                                    } else {
+                                        root.display().to_string()
+                                    });
                                 if header.clicked() {
                                     self.selected_file = Some(root.clone());
                                 }
@@ -1179,6 +1224,8 @@ impl Altadra {
                                     errors: &mut errors,
                                     inline_create: &mut self.file_dialog,
                                     inline_outcome: &mut inline_outcome,
+                                    all_unsaved,
+                                    dirty_paths: &dirty_paths,
                                 };
                                 render_project_tree(ui, &root, &mut tree);
                                 let blank_space = ui.allocate_response(
@@ -1279,11 +1326,12 @@ impl Altadra {
                     .and_then(|root| path.strip_prefix(root).ok())
                     .unwrap_or(&path);
                 ui.heading(display_path.display().to_string());
-                if self.text_file_dirty {
+                let file_unsaved = self.text_file_dirty || self.unsaved_entries.contains(&path);
+                if file_unsaved {
                     ui.label(egui::RichText::new("● Unsaved").color(Color32::YELLOW));
                 }
                 if ui
-                    .add_enabled(self.text_file_dirty, egui::Button::new("Save file"))
+                    .add_enabled(file_unsaved, egui::Button::new("Save file"))
                     .clicked()
                     && let Err(error) = self.save_open_text_file()
                 {
@@ -1714,7 +1762,7 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
                     }
                     let response = ui.selectable_label(
                         tree.selected_file.as_ref() == Some(&path),
-                        format!("📁 {name}"),
+                        unsaved_text(&format!("📁 {name}"), tree.is_unsaved(&path)),
                     );
                     if response.clicked() {
                         *tree.selected_file = Some(path.clone());
@@ -1738,7 +1786,7 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
         } else {
             let response = ui.selectable_label(
                 tree.selected_file.as_ref() == Some(&path),
-                format!("📄 {name}"),
+                unsaved_text(&format!("📄 {name}"), tree.is_unsaved(&path)),
             );
             if response.clicked() {
                 *tree.selected_file = Some(path.clone());
@@ -1756,6 +1804,22 @@ struct TreeContext<'a> {
     errors: &'a mut Vec<String>,
     inline_create: &'a mut Option<FileDialogState>,
     inline_outcome: &'a mut Option<InlineOutcome>,
+    all_unsaved: bool,
+    dirty_paths: &'a [PathBuf],
+}
+
+impl TreeContext<'_> {
+    fn is_unsaved(&self, path: &std::path::Path) -> bool {
+        self.all_unsaved || self.dirty_paths.iter().any(|dirty| dirty.starts_with(path))
+    }
+}
+
+fn unsaved_text(name: &str, unsaved: bool) -> egui::RichText {
+    if unsaved {
+        egui::RichText::new(format!("{name} *")).color(Color32::from_rgb(240, 200, 70))
+    } else {
+        egui::RichText::new(name)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1882,6 +1946,15 @@ fn response_context_menu(
     });
 }
 
+/// Maps a canonical path (with a `\\?\` prefix on Windows) back onto the project root
+/// as shown in the file tree, so paths compare equal to tree entries.
+fn tree_form_path(root: &std::path::Path, path: PathBuf) -> PathBuf {
+    root.canonicalize()
+        .ok()
+        .and_then(|canonical| path.strip_prefix(canonical).ok().map(|rel| root.join(rel)))
+        .unwrap_or(path)
+}
+
 fn asset_name_for_path(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     if relative.parent()? != std::path::Path::new("assets") {
@@ -1949,7 +2022,22 @@ fn project_directory_in(location: &std::path::Path, name: &str) -> Result<PathBu
 
 #[cfg(test)]
 mod tests {
-    use super::{new_project, project_directory_in};
+    use super::{new_project, project_directory_in, tree_form_path};
+
+    #[test]
+    fn canonical_paths_map_back_to_tree_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("scripts")
+            .join("a.lua");
+        assert_eq!(
+            tree_form_path(root.path(), canonical),
+            root.path().join("scripts").join("a.lua")
+        );
+    }
 
     #[test]
     fn project_directory_is_created_inside_selected_location() {

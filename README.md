@@ -52,7 +52,13 @@ subsystem, so it does not open an extra console window.
   tab, and import PNG assets from files anywhere on your computer.
 - The editor's left dock opens to the **Project** tab, which shows the active
   project's files and folders directly; the project folder itself is not a tree
-  row, and its name is shown as the panel header next to the **+** menu. Create files and folders, rename or delete selected
+  row, and its name is shown as the panel header next to the **+** menu. Unsaved
+  items are shown in yellow with a trailing `*` (every item in a never-saved
+  project, newly created files and folders until the next save, the open text
+  file with unsaved edits and its parent folders, and `scene.json` when the
+  scene has unsaved changes); they return to normal once saved. As in VS Code,
+  new files and folders are created on disk immediately; the marker shows they
+  have not been saved yet. Create files and folders, rename or delete selected
   entries, and click UTF-8 text files to edit them. Text edits are limited to
   1 MB and save from the file editor or project Save button. Unsaved projects
   keep files in a temporary workspace and copy them into the chosen project
