@@ -32,6 +32,97 @@ fn main() -> eframe::Result {
     )
 }
 
+struct TextDocument {
+    path: PathBuf,
+    contents: String,
+    dirty: bool,
+    preview: bool,
+}
+
+impl TextDocument {
+    fn save(&mut self, root: &std::path::Path) -> Result<(), String> {
+        if self.dirty {
+            project_files::write_text_file(root, &self.path, &self.contents)?;
+            self.dirty = false;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct EditorFiles {
+    documents: Vec<TextDocument>,
+    active: Option<usize>,
+}
+
+impl EditorFiles {
+    fn open(&mut self, path: PathBuf, contents: String) {
+        self.open_with_preview(path, contents, false);
+    }
+
+    fn open_with_preview(&mut self, path: PathBuf, contents: String, preview: bool) {
+        if let Some(index) = self.documents.iter().position(|file| file.path == path) {
+            if !preview {
+                self.documents[index].preview = false;
+            }
+            self.active = Some(index);
+            return;
+        }
+        let document = TextDocument {
+            path,
+            contents,
+            dirty: false,
+            preview,
+        };
+        let index = if preview
+            && let Some(index) = self
+                .documents
+                .iter()
+                .position(|file| file.preview && !file.dirty)
+        {
+            self.documents[index] = document;
+            index
+        } else {
+            self.documents.push(document);
+            self.documents.len() - 1
+        };
+        self.active = Some(index);
+    }
+
+    fn close(&mut self, index: usize) {
+        self.documents.remove(index);
+        self.active = match self.active {
+            _ if self.documents.is_empty() => None,
+            Some(active) if active == index => Some(index.min(self.documents.len() - 1)),
+            Some(active) if active > index => Some(active - 1),
+            other => other,
+        };
+    }
+
+    fn remove_under(&mut self, path: &std::path::Path) {
+        for index in (0..self.documents.len()).rev() {
+            if self.documents[index].path.starts_with(path) {
+                self.close(index);
+            }
+        }
+    }
+
+    fn remap_paths(&mut self, old: &std::path::Path, new: &std::path::Path) {
+        for file in &mut self.documents {
+            if let Ok(relative) = file.path.strip_prefix(old) {
+                file.path = new.join(relative);
+            }
+        }
+    }
+
+    fn save_all(&mut self, root: &std::path::Path) -> Result<(), String> {
+        for file in &mut self.documents {
+            file.save(root)?;
+        }
+        Ok(())
+    }
+}
+
 struct Altadra {
     page: AppPage,
     project: Project,
@@ -42,9 +133,7 @@ struct Altadra {
     file_workspace: Option<tempfile::TempDir>,
     left_panel_tab: LeftPanelTab,
     selected_file: Option<PathBuf>,
-    open_text_file: Option<PathBuf>,
-    text_buffer: String,
-    text_file_dirty: bool,
+    files: EditorFiles,
     unsaved_entries: Vec<PathBuf>,
     file_dialog: Option<FileDialogState>,
     save_dialog: Option<SaveProjectDialog>,
@@ -81,9 +170,7 @@ impl Altadra {
             file_workspace: None,
             left_panel_tab: LeftPanelTab::Project,
             selected_file: None,
-            open_text_file: None,
-            text_buffer: String::new(),
-            text_file_dirty: false,
+            files: EditorFiles::default(),
             unsaved_entries: Vec::new(),
             file_dialog: None,
             save_dialog: None,
@@ -244,9 +331,7 @@ impl Altadra {
         self.file_workspace = None;
         self.left_panel_tab = LeftPanelTab::Project;
         self.selected_file = self.project.path.clone();
-        self.open_text_file = None;
-        self.text_buffer.clear();
-        self.text_file_dirty = false;
+        self.files = EditorFiles::default();
         self.unsaved_entries.clear();
         self.file_dialog = None;
         self.save_dialog = None;
@@ -316,9 +401,7 @@ impl Altadra {
         self.runtime = None;
         self.file_workspace = None;
         self.selected_file = None;
-        self.open_text_file = None;
-        self.text_buffer.clear();
-        self.text_file_dirty = false;
+        self.files = EditorFiles::default();
         self.unsaved_entries.clear();
         self.save_dialog = None;
         self.page = AppPage::Home;
@@ -499,7 +582,9 @@ impl Altadra {
     }
 
     fn has_unsaved_changes(&self) -> bool {
-        self.dirty || self.text_file_dirty || !self.unsaved_entries.is_empty()
+        self.dirty
+            || self.files.documents.iter().any(|file| file.dirty)
+            || !self.unsaved_entries.is_empty()
     }
 
     fn confirm_discard(&self) -> bool {
@@ -572,7 +657,11 @@ impl Altadra {
     }
 
     fn save_to(&mut self, directory: std::path::PathBuf) -> Result<(), String> {
-        self.save_open_text_file()?;
+        let root = self
+            .file_root_path()
+            .map(PathBuf::from)
+            .ok_or_else(|| "No project folder is available.".to_owned())?;
+        self.files.save_all(&root)?;
         let previous_path = self.project.path.clone();
         let workspace_path = self
             .file_workspace
@@ -586,11 +675,7 @@ impl Altadra {
             .ok_or_else(|| "Saved project folder was not recorded.".to_owned())?;
         if let Some(workspace_path) = workspace_path {
             project_files::copy_workspace_files(&workspace_path, &saved_root)?;
-            if let Some(open_file) = self.open_text_file.as_mut()
-                && let Ok(relative) = open_file.strip_prefix(&workspace_path)
-            {
-                *open_file = saved_root.join(relative);
-            }
+            self.files.remap_paths(&workspace_path, &saved_root);
             if let Some(selected) = self.selected_file.as_mut()
                 && let Ok(relative) = selected.strip_prefix(&workspace_path)
             {
@@ -604,9 +689,7 @@ impl Altadra {
                 self.project.path = Some(previous_path);
                 return Err(error);
             }
-            self.open_text_file = None;
-            self.text_buffer.clear();
-            self.text_file_dirty = false;
+            self.files.remap_paths(&previous_path, &saved_root);
         }
         self.selected_file = self.project.path.clone();
         self.dirty = false;
@@ -617,58 +700,49 @@ impl Altadra {
     }
 
     fn save_open_text_file(&mut self) -> Result<(), String> {
-        if !self.text_file_dirty {
-            // Saving an unmodified new file still counts as its first save.
-            if let Some(file) = &self.open_text_file {
-                self.unsaved_entries.retain(|entry| entry != file);
-            }
+        let Some(index) = self.files.active else {
             return Ok(());
-        }
+        };
+        self.save_text_file(index)
+    }
+
+    fn save_text_file(&mut self, index: usize) -> Result<(), String> {
         if self.runtime.is_some() {
             return Err("Stop play mode before saving project files.".into());
         }
         let root = self
             .file_root_path()
-            .ok_or_else(|| "Save the project before editing project files.".to_owned())?;
+            .map(PathBuf::from)
+            .ok_or_else(|| "No project folder is available.".to_owned())?;
         let file = self
-            .open_text_file
-            .as_deref()
+            .files
+            .documents
+            .get_mut(index)
             .ok_or_else(|| "No text file is open.".to_owned())?;
-        project_files::write_text_file(root, file, &self.text_buffer)?;
-        let file = file.to_path_buf();
-        self.unsaved_entries.retain(|entry| *entry != file);
-        self.text_file_dirty = false;
-        self.status = format!("Saved {}", file.display());
+        file.save(&root)?;
+        self.unsaved_entries.retain(|entry| *entry != file.path);
+        self.status = format!("Saved {}", file.path.display());
         self.error = None;
         Ok(())
     }
 
-    fn open_project_file(&mut self, path: PathBuf) {
+    fn open_project_file(&mut self, path: PathBuf, preview: bool) {
         if self.runtime.is_some() {
             self.status = "Stop play mode before opening project files.".into();
             return;
         }
-        if self.open_text_file.as_ref() == Some(&path) {
-            return;
-        }
-        if self.text_file_dirty {
-            let choice = rfd::MessageDialog::new()
-                .set_title("Unsaved file changes")
-                .set_description("Save changes to the open file before switching?")
-                .set_level(rfd::MessageLevel::Warning)
-                .set_buttons(rfd::MessageButtons::YesNoCancel)
-                .show();
-            match choice {
-                rfd::MessageDialogResult::Yes => {
-                    if let Err(error) = self.save_open_text_file() {
-                        self.error = Some(error.clone());
-                        self.status = error;
-                        return;
-                    }
-                }
-                rfd::MessageDialogResult::No => {}
-                _ => return,
+        if let Some(index) = self
+            .files
+            .documents
+            .iter()
+            .position(|file| file.path == path)
+        {
+            if !preview {
+                self.files.documents[index].preview = false;
             }
+            self.files.active = Some(index);
+            self.selected_file = Some(path);
+            return;
         }
         self.selected_file = Some(path.clone());
         let Some(root) = self.file_root_path() else {
@@ -677,18 +751,17 @@ impl Altadra {
         };
         match project_files::read_text_file(root, &path) {
             Ok(contents) => {
-                self.open_text_file = Some(path.clone());
-                self.text_buffer = contents;
-                self.text_file_dirty = false;
+                if preview {
+                    self.files.open_with_preview(path.clone(), contents, true);
+                } else {
+                    self.files.open(path.clone(), contents);
+                }
                 self.error = None;
                 self.status = format!("Editing {}", path.display());
             }
             Err(error) => {
-                self.open_text_file = None;
-                self.text_buffer.clear();
-                self.text_file_dirty = false;
-                self.status = error;
-                self.error = None;
+                self.status = error.clone();
+                self.error = Some(error);
             }
         }
     }
@@ -798,11 +871,8 @@ impl Altadra {
                         }) {
                             self.selected_file = Some(new_path.clone());
                         }
-                        if let Some(open_file) = self.open_text_file.as_mut()
-                            && let Ok(relative) = open_file.strip_prefix(&old_path)
-                        {
-                            *open_file = new_path.join(relative);
-                        }
+                        self.files
+                            .remap_paths(&old_path, &tree_form_path(&root, new_path.clone()));
                         if let Some((old_name, new_name)) = asset_rename
                             && let Some(bytes) = self.project.assets.remove(&old_name)
                         {
@@ -837,7 +907,7 @@ impl Altadra {
                 self.selected_file = Some(path.clone());
                 self.error = None;
                 if dialog.action == project_files::EntryAction::NewFile {
-                    self.open_project_file(path);
+                    self.open_project_file(path, false);
                 } else {
                     self.status = format!("Updated {}", path.display());
                 }
@@ -886,23 +956,27 @@ impl Altadra {
         {
             return;
         }
-        if self.text_file_dirty
-            && self
-                .open_text_file
-                .as_deref()
-                .is_some_and(|file| file == entry || file.starts_with(&entry))
+        if self
+            .files
+            .documents
+            .iter()
+            .any(|file| file.dirty && file.path.starts_with(&entry))
         {
             let choice = rfd::MessageDialog::new()
                 .set_title("Unsaved file changes")
-                .set_description("Save changes to this file before deleting it?")
+                .set_description("Save changes to the open files in this item before deleting it?")
                 .set_level(rfd::MessageLevel::Warning)
                 .set_buttons(rfd::MessageButtons::YesNoCancel)
                 .show();
             match choice {
                 rfd::MessageDialogResult::Yes => {
-                    if let Err(error) = self.save_open_text_file() {
-                        self.error = Some(error);
-                        return;
+                    for index in 0..self.files.documents.len() {
+                        if self.files.documents[index].path.starts_with(&entry)
+                            && let Err(error) = self.save_text_file(index)
+                        {
+                            self.error = Some(error);
+                            return;
+                        }
                     }
                 }
                 rfd::MessageDialogResult::No => {}
@@ -927,15 +1001,7 @@ impl Altadra {
                     }
                     self.dirty = true;
                 }
-                if self
-                    .open_text_file
-                    .as_deref()
-                    .is_some_and(|file| file == entry || file.starts_with(&entry))
-                {
-                    self.open_text_file = None;
-                    self.text_buffer.clear();
-                    self.text_file_dirty = false;
-                }
+                self.files.remove_under(&entry);
                 self.unsaved_entries
                     .retain(|unsaved| !unsaved.starts_with(&entry));
                 self.selected_file = Some(root);
@@ -1076,20 +1142,28 @@ impl Altadra {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("ALTADRA");
-                ui.separator();
-                if ui.button("⌂ Home").clicked() {
+                if ui.add(egui::Button::new(egui::RichText::new("ALTADRA").heading())
+                    .frame(false)).on_hover_text("Home").clicked() {
                     self.return_home();
                 }
                 ui.separator();
-                for (label, action) in [
-                    ("New", FileAction::New), ("Open", FileAction::Open),
-                    ("Save", FileAction::Save), ("Save As", FileAction::SaveAs),
-                    ("Import PNG", FileAction::Import),
-                ] {
-                    if ui.add_enabled(self.runtime.is_none(), egui::Button::new(label)).clicked() {
-                        self.file_action(action, ctx);
+                let mut file_action = None;
+                ui.menu_button("File", |ui| {
+                    for (label, action) in [
+                        ("New", FileAction::New), ("Open", FileAction::Open),
+                        ("Save", FileAction::Save), ("Save As", FileAction::SaveAs),
+                    ] {
+                        if ui.add_enabled(self.runtime.is_none(), egui::Button::new(label)).clicked() {
+                            file_action = Some(action);
+                            ui.close_menu();
+                        }
                     }
+                });
+                if let Some(action) = file_action {
+                    self.file_action(action, ctx);
+                }
+                if ui.add_enabled(self.runtime.is_none(), egui::Button::new("Import PNG")).clicked() {
+                    self.file_action(FileAction::Import, ctx);
                 }
                 ui.separator();
                 if self.runtime.is_none() {
@@ -1153,11 +1227,13 @@ impl Altadra {
                             };
                             let all_unsaved = self.file_workspace.is_some();
                             let mut dirty_paths = self.unsaved_entries.clone();
-                            if self.text_file_dirty
-                                && let Some(path) = &self.open_text_file
-                            {
-                                dirty_paths.push(path.clone());
-                            }
+                            dirty_paths.extend(
+                                self.files
+                                    .documents
+                                    .iter()
+                                    .filter(|file| file.dirty)
+                                    .map(|file| file.path.clone()),
+                            );
                             if self.dirty {
                                 dirty_paths.push(root.join("scene.json"));
                             }
@@ -1252,8 +1328,8 @@ impl Altadra {
                             if let Some((action, path)) = context_action {
                                 self.handle_tree_action(action, path);
                             }
-                            if let Some(path) = clicked_file {
-                                self.open_project_file(path);
+                            if let Some((path, preview)) = clicked_file {
+                                self.open_project_file(path, preview);
                             }
                             for error in errors {
                                 ui.colored_label(Color32::LIGHT_RED, error);
@@ -1316,17 +1392,78 @@ impl Altadra {
     }
 
     fn text_editor(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.open_text_file.clone() else {
-            return;
-        };
         egui::CentralPanel::default().show(ctx, |ui| {
+            let mut activate = None;
+            let mut close = None;
+            let mut pin = None;
+            egui::ScrollArea::horizontal()
+                .id_salt("file_tabs")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (index, file) in self.files.documents.iter().enumerate() {
+                            ui.push_id(&file.path, |ui| {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        let name = file
+                                            .path
+                                            .file_name()
+                                            .unwrap_or(file.path.as_os_str())
+                                            .to_string_lossy();
+                                        let unsaved = file.dirty
+                                            || self.unsaved_entries.contains(&file.path)
+                                            || self.file_workspace.is_some();
+                                        let mut label = unsaved_text(&name, unsaved);
+                                        if file.preview {
+                                            label = label.italics();
+                                        }
+                                        let response = ui
+                                            .selectable_label(
+                                                self.files.active == Some(index),
+                                                label,
+                                            )
+                                            .on_hover_text(file.path.display().to_string());
+                                        if response.clicked() {
+                                            activate = Some(index);
+                                        }
+                                        if response.double_clicked() {
+                                            pin = Some(index);
+                                        }
+                                        if ui
+                                            .small_button("x")
+                                            .on_hover_text("Close file")
+                                            .clicked()
+                                        {
+                                            close = Some(index);
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                    });
+                });
+            if let Some(index) = pin {
+                self.files.documents[index].preview = false;
+            }
+            if let Some(index) = activate {
+                self.files.active = Some(index);
+                self.selected_file = Some(self.files.documents[index].path.clone());
+            }
+            if let Some(index) = close {
+                self.close_text_file(index);
+            }
+            let Some(index) = self.files.active else {
+                return;
+            };
+            let path = self.files.documents[index].path.clone();
+            ui.separator();
             ui.horizontal(|ui| {
                 let display_path = self
                     .file_root_path()
                     .and_then(|root| path.strip_prefix(root).ok())
                     .unwrap_or(&path);
                 ui.heading(display_path.display().to_string());
-                let file_unsaved = self.text_file_dirty || self.unsaved_entries.contains(&path);
+                let file_unsaved =
+                    self.files.documents[index].dirty || self.unsaved_entries.contains(&path);
                 if file_unsaved {
                     ui.label(egui::RichText::new("● Unsaved").color(Color32::YELLOW));
                 }
@@ -1337,26 +1474,25 @@ impl Altadra {
                 {
                     self.error = Some(error);
                 }
-                if ui.button("Close file").clicked() {
-                    self.close_open_text_file();
-                }
             });
             ui.separator();
             let response = ui.add(
-                egui::TextEdit::multiline(&mut self.text_buffer)
+                egui::TextEdit::multiline(&mut self.files.documents[index].contents)
+                    .id_source(("file_editor", &path))
                     .code_editor()
                     .desired_width(f32::INFINITY)
                     .desired_rows(24),
             );
             if response.changed() {
-                self.text_file_dirty = true;
+                self.files.documents[index].dirty = true;
+                self.files.documents[index].preview = false;
                 self.error = None;
             }
         });
     }
 
-    fn close_open_text_file(&mut self) {
-        if self.text_file_dirty {
+    fn close_text_file(&mut self, index: usize) {
+        if self.files.documents[index].dirty {
             let choice = rfd::MessageDialog::new()
                 .set_title("Unsaved file changes")
                 .set_description("Save changes to this file before closing it?")
@@ -1365,7 +1501,7 @@ impl Altadra {
                 .show();
             match choice {
                 rfd::MessageDialogResult::Yes => {
-                    if let Err(error) = self.save_open_text_file() {
+                    if let Err(error) = self.save_text_file(index) {
                         self.error = Some(error);
                         return;
                     }
@@ -1374,9 +1510,11 @@ impl Altadra {
                 _ => return,
             }
         }
-        self.open_text_file = None;
-        self.text_buffer.clear();
-        self.text_file_dirty = false;
+        let was_active = self.files.active == Some(index);
+        self.files.close(index);
+        if was_active && let Some(active) = self.files.active {
+            self.selected_file = Some(self.files.documents[active].path.clone());
+        }
     }
 
     fn inspector(&mut self, ctx: &egui::Context) {
@@ -1664,7 +1802,7 @@ impl eframe::App for Altadra {
                 self.top_bar(ctx);
                 self.left_panel(ctx);
                 self.inspector(ctx);
-                if self.open_text_file.is_some() {
+                if self.files.active.is_some() {
                     self.text_editor(ctx);
                 } else {
                     self.viewport(ctx);
@@ -1790,7 +1928,7 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
             );
             if response.clicked() {
                 *tree.selected_file = Some(path.clone());
-                *tree.clicked_file = Some(path.clone());
+                *tree.clicked_file = Some((path.clone(), !response.double_clicked()));
             }
             response_context_menu(&response, &path, TreeEntryKind::File, tree.context_action);
         }
@@ -1799,7 +1937,7 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
 
 struct TreeContext<'a> {
     selected_file: &'a mut Option<PathBuf>,
-    clicked_file: &'a mut Option<PathBuf>,
+    clicked_file: &'a mut Option<(PathBuf, bool)>,
     context_action: &'a mut Option<(TreeAction, PathBuf)>,
     errors: &'a mut Vec<String>,
     inline_create: &'a mut Option<FileDialogState>,
@@ -2022,7 +2160,128 @@ fn project_directory_in(location: &std::path::Path, name: &str) -> Result<PathBu
 
 #[cfg(test)]
 mod tests {
-    use super::{new_project, project_directory_in, tree_form_path};
+    use super::{EditorFiles, new_project, project_directory_in, tree_form_path};
+
+    #[test]
+    fn previews_replace_only_clean_preview_tabs() {
+        let mut files = EditorFiles::default();
+        files.open("kept.lua".into(), "kept".into());
+        files.open_with_preview("first.lua".into(), "first".into(), true);
+        files.open_with_preview("second.lua".into(), "second".into(), true);
+        assert_eq!(files.documents.len(), 2);
+        assert_eq!(files.documents[1].path, std::path::Path::new("second.lua"));
+        assert!(files.documents[1].preview);
+        files.open("second.lua".into(), "do not reload".into());
+        assert!(!files.documents[1].preview);
+        assert_eq!(files.documents[1].contents, "second");
+        files.open_with_preview("third.lua".into(), "third".into(), true);
+        assert_eq!(files.documents.len(), 3);
+        files.documents[2].dirty = true;
+        files.open_with_preview("fourth.lua".into(), "fourth".into(), true);
+        assert_eq!(files.documents.len(), 4);
+        assert!(files.documents[2].dirty);
+        files.open_with_preview("kept.lua".into(), "do not reload".into(), true);
+        assert!(!files.documents[0].preview);
+        assert_eq!(files.active, Some(0));
+    }
+
+    #[test]
+    fn opening_tabs_preserves_edits_and_reuses_existing_tab() {
+        let mut files = EditorFiles::default();
+        files.open("first.lua".into(), "original".into());
+        files.documents[0].contents = "edited".into();
+        files.documents[0].dirty = true;
+        files.open("second.lua".into(), "second".into());
+        files.open("first.lua".into(), "should not replace edits".into());
+
+        assert_eq!(files.documents.len(), 2);
+        assert_eq!(files.active, Some(0));
+        assert_eq!(files.documents[0].contents, "edited");
+        assert!(files.documents[0].dirty);
+    }
+
+    #[test]
+    fn closing_tabs_keeps_active_tab_valid() {
+        let mut files = EditorFiles::default();
+        for name in ["first", "second", "third"] {
+            files.open(name.into(), name.into());
+        }
+        files.close(0);
+        assert_eq!(files.active, Some(1));
+        assert_eq!(files.documents[1].contents, "third");
+        files.close(1);
+        assert_eq!(files.active, Some(0));
+        files.close(0);
+        assert_eq!(files.active, None);
+        assert!(files.documents.is_empty());
+
+        for name in ["first", "second", "third"] {
+            files.open(name.into(), name.into());
+        }
+        files.active = Some(1);
+        files.close(1);
+        assert_eq!(files.active, Some(1));
+        assert_eq!(files.documents[1].contents, "third");
+        files.active = Some(0);
+        files.close(1);
+        assert_eq!(files.active, Some(0));
+        assert_eq!(files.documents[0].contents, "first");
+    }
+
+    #[test]
+    fn rename_and_delete_update_all_affected_tabs() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("scripts");
+        let new = root.path().join("renamed");
+        let mut files = EditorFiles::default();
+        files.open(old.join("a.lua"), "unsaved".into());
+        files.documents[0].dirty = true;
+        files.open(old.join("nested").join("b.lua"), "b".into());
+        let unrelated = root.path().join("other.lua");
+        files.open(unrelated.clone(), "other".into());
+
+        files.remap_paths(&old, &new);
+        assert_eq!(files.documents[0].path, new.join("a.lua"));
+        assert_eq!(files.documents[1].path, new.join("nested").join("b.lua"));
+        assert!(files.documents[0].dirty);
+        assert_eq!(files.documents[0].contents, "unsaved");
+        files.remove_under(&new);
+        assert_eq!(files.documents.len(), 1);
+        assert_eq!(files.documents[0].path, unrelated);
+        assert_eq!(files.active, Some(0));
+    }
+
+    #[test]
+    fn project_save_writes_edits_from_inactive_tabs_too() {
+        let root = tempfile::tempdir().unwrap();
+        let mut files = EditorFiles::default();
+        for name in ["first.lua", "second.lua"] {
+            let path = root.path().join(name);
+            std::fs::write(&path, "").unwrap();
+            files.open(path, format!("edited {name}"));
+            files.documents.last_mut().unwrap().dirty = true;
+        }
+        files.save_all(root.path()).unwrap();
+        for file in &files.documents {
+            assert_eq!(std::fs::read_to_string(&file.path).unwrap(), file.contents);
+            assert!(!file.dirty);
+        }
+        let moved = root.path().join("new-project");
+        files.remap_paths(root.path(), &moved);
+        assert_eq!(files.documents[0].path, moved.join("first.lua"));
+        assert_eq!(files.active, Some(1));
+    }
+
+    #[test]
+    fn failed_tab_save_preserves_unsaved_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        let mut files = EditorFiles::default();
+        files.open(root.path().join("missing.lua"), "keep my changes".into());
+        files.documents[0].dirty = true;
+        assert!(files.save_all(root.path()).is_err());
+        assert!(files.documents[0].dirty);
+        assert_eq!(files.documents[0].contents, "keep my changes");
+    }
 
     #[test]
     fn canonical_paths_map_back_to_tree_paths() {

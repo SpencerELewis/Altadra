@@ -44,7 +44,7 @@ subsystem, so it does not open an extra console window.
 - The Home page lists up to 12 recently opened projects. Open one directly, remove
   an entry, or clear the list. Recent projects are stored in your user application
   data (`%APPDATA%\Altadra\recent-projects.json` on Windows).
-- **Home** in the editor returns to the project picker; unsaved changes require
+- Click **ALTADRA** in the editor's top bar to return to the project picker; unsaved changes require
   confirmation. Exiting an unsaved project or a project with recent edits asks
   whether to save, discard, or cancel. Existing projects save to their current
   folder; new projects open the Save project dialog.
@@ -54,8 +54,8 @@ subsystem, so it does not open an extra console window.
   project's files and folders directly; the project folder itself is not a tree
   row, and its name is shown as the panel header next to the **+** menu. Unsaved
   items are shown in yellow with a trailing `*` (every item in a never-saved
-  project, newly created files and folders until the next save, the open text
-  file with unsaved edits and its parent folders, and `scene.json` when the
+  project, newly created files and folders until the next save, open text
+  files with unsaved edits and their parent folders, and `scene.json` when the
   scene has unsaved changes); they return to normal once saved. As in VS Code,
   new files and folders are created on disk immediately; the marker shows they
   have not been saved yet. Create files and folders, rename or delete selected
@@ -71,6 +71,16 @@ subsystem, so it does not open an extra console window.
   folder and press **Delete** to
   remove it (with confirmation). Selected sprites have a bright outline in the
   viewport. Switch to **Scene** for the sprite hierarchy and controls.
+- Open text files appear as tabs across the top of the file editor. Click a tab
+  to switch without losing unsaved edits; opening the same file again selects
+  its existing tab. Each tab has an **x** to close it; closing an edited file
+  asks whether to save, discard, or cancel. Unsaved tabs have yellow names and
+  a trailing `*`, and hovering a tab shows its full path. The tab strip scrolls
+  horizontally when needed. Closing the last tab returns to the scene viewport.
+  **Save file** saves only the active tab; project **Save** saves all open files.
+- Single-clicking a file opens an italic preview tab; opening another preview
+  replaces it. Double-click a file or its tab to keep it open. Editing a preview
+  also keeps it open automatically; unsaved edits are never replaced.
 - Edit name, position, rotation, scale, size, tint, visibility, velocity, and each
   sprite's Lua script in the inspector.
 - Click sprites to select them in the viewport. Rotation and scale are used for
@@ -78,11 +88,12 @@ subsystem, so it does not open an extra console window.
   +Y is down; the last sprite draws on top.
 - Import PNG files. Images are copied into the project on save. They can be tinted
   in the inspector. Without an imported image, sprites render as solid-color quads.
-- New, Open, Save, and Save As operate on project directories. Save As uses the
+- **File** in the top bar contains **New**, **Open**, **Save**, and **Save As**,
+  which operate on project directories. Save As uses the
   same Save project dialog: the chosen folder is the location, and a new project
   folder with the given name is created inside it (existing folders are never
   overwritten). Unsaved changes require confirmation. Press **Ctrl+S** to save
-  the project (and any open text file); unsaved new projects open the Save
+  the project (and all open text files); unsaved new projects open the Save
   project dialog.
 - Play runs a fixed 60 Hz clone of the authoring scene. Click the viewport and use
   WASD or arrow keys; Stop discards runtime changes and preserves the authored scene.

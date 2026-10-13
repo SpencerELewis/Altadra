@@ -51,7 +51,16 @@ cargo build --release --locked
 - The save flow (`SaveProjectDialog`) treats the picked folder as the **location**
   and creates `<location>\<project name>`; it never overwrites an existing folder.
   Used by first Save, Save As, Ctrl+S on unsaved projects, and save-on-exit.
-- Unsaved tracking: `dirty` (scene), `text_file_dirty` (open text file),
+- `files: EditorFiles` holds a vector of `TextDocument`s (path, contents, dirty)
+  and an active tab index. Switching tabs preserves buffers; closing dirty tabs
+  prompts. Project Save writes every dirty document before copying project files;
+  Save file writes only the active document. Remap all tab paths on rename,
+  first save, and Save As; remove affected tabs only after successful deletion.
+- Documents have a `preview` flag: single-click replaces the clean preview tab,
+  double-click pins it, and editing pins it automatically. Preview labels are
+  italic. Never replace a dirty buffer. The File menu holds project actions;
+  clicking ALTADRA returns Home using the existing unsaved-changes prompt.
+- Unsaved tracking: `dirty` (scene), each document's `dirty` flag,
   `unsaved_entries` (files/folders created since the last save). Use
   `has_unsaved_changes()` for prompts/status. The tree renders unsaved items in
   yellow with a trailing ` *`.
