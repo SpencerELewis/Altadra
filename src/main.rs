@@ -4,13 +4,16 @@
 )]
 
 mod project;
+mod recent;
 mod runtime;
 mod scene;
 
 use eframe::egui::{self, Color32, Pos2, Sense, Stroke, Vec2};
 use project::Project;
+use recent::RecentProjects;
 use runtime::Runtime;
 use scene::{Scene, Sprite};
+use std::path::PathBuf;
 use std::time::Instant;
 
 fn main() -> eframe::Result {
@@ -29,7 +32,14 @@ fn main() -> eframe::Result {
 }
 
 struct Altadra {
+    page: AppPage,
     project: Project,
+    recents: RecentProjects,
+    recent_error: Option<String>,
+    project_name: String,
+    projects_parent: Option<PathBuf>,
+    left_panel_tab: LeftPanelTab,
+    selected_file: Option<PathBuf>,
     selected: Option<String>,
     runtime: Option<Runtime>,
     textures: std::collections::HashMap<String, egui::TextureHandle>,
@@ -43,24 +53,26 @@ struct Altadra {
 impl Altadra {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let mut project = Project::default();
+        let project = starter_project();
         let player = project.scene.sprites[0].id.clone();
-        project.scene.sprites[0].script = r#"return function(entity, input, dt)
-    local speed = 180
-    if input.left then entity.x = entity.x - speed * dt end
-    if input.right then entity.x = entity.x + speed * dt end
-    if input.up then entity.y = entity.y - speed * dt end
-    if input.down then entity.y = entity.y + speed * dt end
-end"#
-            .into();
+        let (recents, recent_error) = match RecentProjects::load() {
+            Ok(recents) => (recents, None),
+            Err(error) => (RecentProjects::default(), Some(error)),
+        };
         let mut app = Self {
+            page: AppPage::Home,
             project,
+            recents,
+            recent_error,
+            project_name: "My 2D Game".into(),
+            projects_parent: None,
+            left_panel_tab: LeftPanelTab::Project,
+            selected_file: None,
             selected: Some(player),
             runtime: None,
             textures: Default::default(),
-            dirty: true,
-            status: "Ready — select a sprite, edit its properties or Lua script, then press Play."
-                .into(),
+            dirty: false,
+            status: "Choose a project to get started.".into(),
             error: None,
             last_tick: Instant::now(),
             viewport_focused: false,
@@ -79,6 +91,259 @@ end"#
         }
     }
 
+    fn remember_project(&mut self, path: &std::path::Path) {
+        match self.recents.record(path) {
+            Ok(()) => self.recent_error = None,
+            Err(error) => self.recent_error = Some(error),
+        }
+    }
+
+    fn new_project_directory(&mut self) -> Option<PathBuf> {
+        if let Err(error) = project::validate_project_name(&self.project_name) {
+            self.error = Some(error);
+            return None;
+        }
+        let parent = self.projects_parent.clone().or_else(|| {
+            rfd::FileDialog::new()
+                .set_title("Choose a location for your new project")
+                .pick_folder()
+        })?;
+        self.projects_parent = Some(parent.clone());
+        let directory = parent.join(self.project_name.trim());
+        if directory.exists() {
+            self.error = Some(format!(
+                "'{}' already exists. Choose another name or open the existing project.",
+                directory.display()
+            ));
+            return None;
+        }
+        Some(directory)
+    }
+
+    fn activate_project(&mut self, project: Project, ctx: &egui::Context) {
+        self.project = project;
+        self.left_panel_tab = LeftPanelTab::Project;
+        self.selected_file = None;
+        self.selected = self
+            .project
+            .scene
+            .sprites
+            .first()
+            .map(|sprite| sprite.id.clone());
+        self.dirty = false;
+        self.runtime = None;
+        self.page = AppPage::Editor;
+        self.error = None;
+        self.refresh_textures(ctx);
+        if let Some(path) = self.project.path.clone() {
+            self.remember_project(&path);
+            self.status = format!("Opened {}", path.display());
+        }
+    }
+
+    fn create_project(&mut self, ctx: &egui::Context) {
+        if let Err(error) = project::validate_project_name(&self.project_name) {
+            self.error = Some(error);
+            return;
+        }
+        self.activate_project(starter_project(), ctx);
+        self.dirty = true;
+        self.status = "New project is unsaved. Save it from the toolbar or when exiting.".into();
+    }
+
+    fn open_project(&mut self, path: &std::path::Path, ctx: &egui::Context) {
+        if self.page == AppPage::Editor && !self.confirm_discard() {
+            return;
+        }
+        match Project::load(path) {
+            Ok(project) => self.activate_project(project, ctx),
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn return_home(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        self.dirty = false;
+        self.runtime = None;
+        self.page = AppPage::Home;
+        self.error = None;
+        self.status = "Choose a project to get started.".into();
+    }
+
+    fn home_page(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(15, 21, 31))
+                    .inner_margin(32.0),
+            )
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(24.0);
+                    ui.label(
+                        egui::RichText::new("ALTADRA")
+                            .size(16.0)
+                            .strong()
+                            .color(Color32::from_rgb(115, 189, 255)),
+                    );
+                    ui.add_space(12.0);
+                    ui.heading(egui::RichText::new("Make something playable.").size(38.0).strong());
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Your 2D game studio for Rust and Lua.")
+                            .size(16.0)
+                            .color(Color32::from_rgb(165, 179, 199)),
+                    );
+                    ui.add_space(26.0);
+                });
+
+                if let Some(error) = &self.recent_error {
+                    ui.colored_label(Color32::LIGHT_RED, format!("Recent projects: {error}"));
+                }
+                if let Some(error) = &self.error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+
+                ui.columns(2, |columns| {
+                    columns[0].group(|ui| {
+                        ui.set_min_height(190.0);
+                        ui.heading("New project");
+                        ui.add_space(8.0);
+                        ui.label("Project name");
+                        ui.text_edit_singleline(&mut self.project_name);
+                        ui.add_space(6.0);
+                        ui.label("Save location (optional)");
+                        ui.horizontal(|ui| {
+                            let location = self
+                                .projects_parent
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "Choose later when saving…".into());
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(location).small().color(Color32::GRAY),
+                                )
+                                .truncate(),
+                            );
+                            if ui.button("Browse").clicked()
+                                && let Some(parent) = rfd::FileDialog::new()
+                                    .set_title("Choose a location for your new project")
+                                    .pick_folder()
+                            {
+                                self.projects_parent = Some(parent);
+                            }
+                        });
+                        ui.add_space(6.0);
+                        if ui
+                            .button(egui::RichText::new("＋  Create project").strong())
+                            .clicked()
+                        {
+                            self.create_project(ctx);
+                        }
+                        ui.label(
+                            egui::RichText::new("Starts unsaved. Save from the editor or when exiting.")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    });
+                    columns[1].group(|ui| {
+                        ui.set_min_height(190.0);
+                        ui.heading("Open a project");
+                        ui.add_space(8.0);
+                        ui.label(
+                            "Open an existing project folder or import a project from another location.",
+                        );
+                        ui.add_space(14.0);
+                        if ui
+                            .button(egui::RichText::new("↗  Open / import project…").strong())
+                            .clicked()
+                            && let Some(path) = rfd::FileDialog::new()
+                                .set_title("Open or import an Altadra project folder")
+                                .pick_folder()
+                        {
+                            self.open_project(&path, ctx);
+                        }
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("Choose a folder containing scene.json and assets.")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    });
+                });
+
+                ui.add_space(26.0);
+                ui.horizontal(|ui| {
+                    ui.heading("Recent projects");
+                    if (!self.recents.projects.is_empty() || self.recent_error.is_some())
+                        && ui.small_button("Clear list").clicked()
+                    {
+                        match self.recents.clear() {
+                            Ok(()) => self.recent_error = None,
+                            Err(error) => self.recent_error = Some(error),
+                        }
+                    }
+                });
+                ui.separator();
+                if self.recents.projects.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Your recent projects will appear here. Create or open one to get started.",
+                        )
+                        .color(Color32::GRAY),
+                    );
+                } else {
+                    let mut open_path = None;
+                    let mut remove_path = None;
+                    for recent in self.recents.projects.clone() {
+                        ui.horizontal(|ui| {
+                            let exists = recent.path.join("scene.json").is_file();
+                            let label = if exists {
+                                recent.name.as_str()
+                            } else {
+                                "Missing project folder"
+                            };
+                            if ui
+                                .add_enabled(
+                                    exists,
+                                    egui::Button::new(label).min_size(Vec2::new(160.0, 30.0)),
+                                )
+                                .clicked()
+                            {
+                                open_path = Some(recent.path.clone());
+                            }
+                            ui.label(
+                                egui::RichText::new(recent.path.display().to_string())
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
+                            if ui.small_button("Remove").clicked() {
+                                remove_path = Some(recent.path.clone());
+                            }
+                        });
+                    }
+                    if let Some(path) = open_path {
+                        self.open_project(&path, ctx);
+                    }
+                    if let Some(path) = remove_path {
+                        match self.recents.remove(&path) {
+                            Ok(()) => self.recent_error = None,
+                            Err(error) => self.recent_error = Some(error),
+                        }
+                    }
+                }
+                ui.add_space(18.0);
+                ui.label(
+                    egui::RichText::new("Rust engine  ·  Lua 5.4  ·  portable projects")
+                        .small()
+                        .color(Color32::from_rgb(110, 127, 150)),
+                );
+            });
+    }
+
     fn confirm_discard(&self) -> bool {
         !self.dirty
             || rfd::MessageDialog::new()
@@ -90,12 +355,58 @@ end"#
                 == rfd::MessageDialogResult::Yes
     }
 
-    fn handle_close_request(&self, ctx: &egui::Context) {
-        if self.dirty
-            && ctx.input(|input| input.viewport().close_requested())
-            && !self.confirm_discard()
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if self.page != AppPage::Editor
+            || !(self.dirty || self.project.path.is_none())
+            || !ctx.input(|input| input.viewport().close_requested())
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            return;
+        }
+
+        let description = if self.project.path.is_some() {
+            "Save your most recent project changes before exiting?"
+        } else {
+            "This project has not been saved yet. Save it before exiting?"
+        };
+        let choice = rfd::MessageDialog::new()
+            .set_title("Save project?")
+            .set_description(description)
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::YesNoCancel)
+            .show();
+
+        match choice {
+            rfd::MessageDialogResult::Yes => {
+                let directory = if let Some(path) = self.project.path.clone() {
+                    Some(path)
+                } else {
+                    self.new_project_directory()
+                };
+
+                let Some(directory) = directory else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    return;
+                };
+                if self.project.path.is_none() && directory.exists() {
+                    self.error = Some(format!(
+                        "'{}' already exists. Choose a different project name or save location.",
+                        directory.display()
+                    ));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    return;
+                }
+                if let Err(error) = self.save_to(directory) {
+                    self.error = Some(error.clone());
+                    self.status = error;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+            }
+            rfd::MessageDialogResult::No => {}
+            rfd::MessageDialogResult::Cancel
+            | rfd::MessageDialogResult::Ok
+            | rfd::MessageDialogResult::Custom(_) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            }
         }
     }
 
@@ -119,6 +430,7 @@ end"#
         self.project.save(&directory).map_err(|e| e.to_string())?;
         self.dirty = false;
         self.status = format!("Saved {}", directory.display());
+        self.remember_project(&directory);
         Ok(())
     }
 
@@ -129,14 +441,7 @@ end"#
         }
         match action {
             FileAction::New => {
-                if !self.confirm_discard() {
-                    return;
-                }
-                self.project = Project::default();
-                self.selected = self.project.scene.sprites.first().map(|s| s.id.clone());
-                self.dirty = true;
-                self.refresh_textures(ctx);
-                self.status = "Created a new example scene.".into();
+                self.return_home();
             }
             FileAction::Open => {
                 if !self.confirm_discard() {
@@ -146,31 +451,21 @@ end"#
                     .set_title("Open Altadra project")
                     .pick_folder()
                 {
-                    match Project::load(&directory) {
-                        Ok(project) => {
-                            self.project = project;
-                            self.selected =
-                                self.project.scene.sprites.first().map(|s| s.id.clone());
-                            self.dirty = false;
-                            self.refresh_textures(ctx);
-                            self.status = format!("Opened {}", directory.display());
-                            self.error = None;
-                        }
-                        Err(e) => self.error = Some(e.to_string()),
-                    }
+                    self.open_project(&directory, ctx);
                 }
             }
             FileAction::Save | FileAction::SaveAs => {
                 let directory = if action == FileAction::Save {
-                    self.project.path.clone()
+                    if self.project.path.is_some() {
+                        self.project.path.clone()
+                    } else {
+                        self.new_project_directory()
+                    }
                 } else {
-                    None
-                };
-                let directory = directory.or_else(|| {
                     rfd::FileDialog::new()
                         .set_title("Choose a folder for the Altadra project")
                         .pick_folder()
-                });
+                };
                 if let Some(directory) = directory {
                     if directory.join("scene.json").exists()
                         && self.project.path.as_ref() != Some(&directory)
@@ -265,6 +560,10 @@ end"#
             ui.horizontal_wrapped(|ui| {
                 ui.heading("ALTADRA");
                 ui.separator();
+                if ui.button("⌂ Home").clicked() {
+                    self.return_home();
+                }
+                ui.separator();
                 for (label, action) in [
                     ("New", FileAction::New), ("Open", FileAction::Open),
                     ("Save", FileAction::Save), ("Save As", FileAction::SaveAs),
@@ -297,40 +596,105 @@ end"#
         });
     }
 
-    fn scene_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("scene_hierarchy")
+    fn left_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("project_and_scene")
             .resizable(true)
-            .default_width(195.0)
+            .default_width(235.0)
             .show(ctx, |ui| {
-                ui.heading("Scene");
-                let sprites = &self.project.scene.sprites;
-                let selected = self.selected.clone();
-                for sprite in sprites {
-                    let label = format!("▰  {}", sprite.name);
+                ui.horizontal(|ui| {
                     if ui
-                        .selectable_label(selected.as_deref() == Some(&sprite.id), label)
+                        .selectable_label(self.left_panel_tab == LeftPanelTab::Project, "Project")
                         .clicked()
                     {
-                        self.selected = Some(sprite.id.clone());
+                        self.left_panel_tab = LeftPanelTab::Project;
                     }
-                }
-                ui.separator();
-                ui.add_enabled_ui(self.runtime.is_none(), |ui| {
-                    if ui.button("+ Add sprite").clicked() {
-                        let sprite =
-                            Sprite::new(format!("Sprite {}", self.project.scene.sprites.len() + 1));
-                        self.selected = Some(sprite.id.clone());
-                        self.project.scene.sprites.push(sprite);
-                        self.dirty = true;
-                    }
-                    if ui.button("Delete selected").clicked()
-                        && let Some(id) = &self.selected
+                    if ui
+                        .selectable_label(self.left_panel_tab == LeftPanelTab::Scene, "Scene")
+                        .clicked()
                     {
-                        self.project.scene.sprites.retain(|s| &s.id != id);
-                        self.selected = self.project.scene.sprites.first().map(|s| s.id.clone());
-                        self.dirty = true;
+                        self.left_panel_tab = LeftPanelTab::Scene;
                     }
                 });
+                ui.separator();
+
+                match self.left_panel_tab {
+                    LeftPanelTab::Project => {
+                        if let Some(root) = self.project.path.as_deref() {
+                            let root_name = root
+                                .file_name()
+                                .unwrap_or(root.as_os_str())
+                                .to_string_lossy()
+                                .into_owned();
+                            ui.label(egui::RichText::new(&root_name).strong())
+                                .on_hover_text(root.display().to_string());
+                            ui.separator();
+
+                            let mut errors = Vec::new();
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                egui::CollapsingHeader::new(format!("📁 {root_name}"))
+                                    .id_salt(root)
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        render_project_tree(
+                                            ui,
+                                            root,
+                                            &mut self.selected_file,
+                                            &mut errors,
+                                        );
+                                    });
+                            });
+                            for error in errors {
+                                ui.colored_label(Color32::LIGHT_RED, error);
+                            }
+                            if let Some(path) = &self.selected_file {
+                                ui.separator();
+                                ui.label(
+                                    path.strip_prefix(root)
+                                        .unwrap_or(path)
+                                        .display()
+                                        .to_string(),
+                                )
+                                .on_hover_text(path.display().to_string());
+                            }
+                        } else {
+                            ui.label("Unsaved project — no files saved yet.");
+                        }
+                    }
+                    LeftPanelTab::Scene => {
+                        ui.heading("Scene");
+                        let sprites = &self.project.scene.sprites;
+                        let selected = self.selected.clone();
+                        for sprite in sprites {
+                            let label = format!("▰  {}", sprite.name);
+                            if ui
+                                .selectable_label(selected.as_deref() == Some(&sprite.id), label)
+                                .clicked()
+                            {
+                                self.selected = Some(sprite.id.clone());
+                            }
+                        }
+                        ui.separator();
+                        ui.add_enabled_ui(self.runtime.is_none(), |ui| {
+                            if ui.button("+ Add sprite").clicked() {
+                                let sprite = Sprite::new(format!(
+                                    "Sprite {}",
+                                    self.project.scene.sprites.len() + 1
+                                ));
+                                self.selected = Some(sprite.id.clone());
+                                self.project.scene.sprites.push(sprite);
+                                self.dirty = true;
+                            }
+                            if ui.button("Delete selected").clicked()
+                                && let Some(id) = &self.selected
+                            {
+                                self.project.scene.sprites.retain(|s| &s.id != id);
+                                self.selected =
+                                    self.project.scene.sprites.first().map(|s| s.id.clone());
+                                self.dirty = true;
+                            }
+                        });
+                    }
+                }
             });
     }
 
@@ -589,22 +953,122 @@ fn rotated_corners(center: Pos2, size: Vec2, angle: f32) -> [Pos2; 4] {
 impl eframe::App for Altadra {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
-        self.update_play(ctx);
+        if self.page == AppPage::Editor {
+            self.update_play(ctx);
+        }
         if self.runtime.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_secs_f64(1.0 / 60.0));
         }
-        self.top_bar(ctx);
-        self.scene_panel(ctx);
-        self.inspector(ctx);
-        self.viewport(ctx);
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            if let Some(error) = &self.error {
-                ui.colored_label(Color32::LIGHT_RED, error);
-            } else {
-                ui.label(&self.status);
+        match self.page {
+            AppPage::Home => self.home_page(ctx),
+            AppPage::Editor => {
+                self.top_bar(ctx);
+                self.left_panel(ctx);
+                self.inspector(ctx);
+                self.viewport(ctx);
+                egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+                    if let Some(error) = &self.error {
+                        ui.colored_label(Color32::LIGHT_RED, error);
+                    } else {
+                        ui.label(&self.status);
+                    }
+                });
             }
-        });
+        }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppPage {
+    Home,
+    Editor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeftPanelTab {
+    Project,
+    Scene,
+}
+
+fn render_project_tree(
+    ui: &mut egui::Ui,
+    directory: &std::path::Path,
+    selected_file: &mut Option<PathBuf>,
+    errors: &mut Vec<String>,
+) {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(format!("Could not read {}: {error}", directory.display()));
+            return;
+        }
+    };
+    let mut entries = entries
+        .filter_map(|entry| match entry {
+            Ok(entry) => match entry.file_type() {
+                Ok(file_type) if !file_type.is_symlink() => Some(Ok((entry, file_type))),
+                Ok(_) => None,
+                Err(error) => Some(Err(format!(
+                    "Could not inspect an entry in {}: {error}",
+                    directory.display()
+                ))),
+            },
+            Err(error) => Some(Err(format!(
+                "Could not read an entry in {}: {error}",
+                directory.display()
+            ))),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| match (a, b) {
+        (Ok((a, a_type)), Ok((b, b_type))) => {
+            b_type.is_dir().cmp(&a_type.is_dir()).then_with(|| {
+                a.file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .cmp(&b.file_name().to_string_lossy().to_lowercase())
+            })
+        }
+        _ => std::cmp::Ordering::Equal,
+    });
+
+    for entry in entries {
+        let (entry, file_type) = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if file_type.is_dir() {
+            egui::CollapsingHeader::new(format!("📁 {name}"))
+                .id_salt(&path)
+                .show(ui, |ui| {
+                    render_project_tree(ui, &path, selected_file, errors)
+                });
+        } else if ui
+            .selectable_label(selected_file.as_ref() == Some(&path), format!("📄 {name}"))
+            .clicked()
+        {
+            *selected_file = Some(path);
+        }
+    }
+}
+
+fn starter_project() -> Project {
+    let mut project = Project::default();
+    if let Some(player) = project.scene.sprites.first_mut() {
+        player.script = r#"return function(entity, input, dt)
+    local speed = 180
+    if input.left then entity.x = entity.x - speed * dt end
+    if input.right then entity.x = entity.x + speed * dt end
+    if input.up then entity.y = entity.y - speed * dt end
+    if input.down then entity.y = entity.y + speed * dt end
+end"#
+            .into();
+    }
+    project
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

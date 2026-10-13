@@ -36,6 +36,35 @@ pub fn validate_asset_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_project_name(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return Err("Project names must contain 1 to 80 characters.".into());
+    }
+    if name.ends_with([' ', '.'])
+        || name.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+                )
+        })
+    {
+        return Err(
+            "Project names cannot contain path separators or Windows-invalid characters.".into(),
+        );
+    }
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit())
+    {
+        return Err("This name is reserved by Windows; choose another project name.".into());
+    }
+    Ok(())
+}
+
 impl Project {
     pub fn import_png(&mut self, bytes: &[u8]) -> Result<String, String> {
         validate_png_header(bytes)?;
@@ -223,6 +252,16 @@ mod tests {
             "assets/a/b.png",
         ] {
             assert!(validate_asset_name(name).is_err(), "accepted {name}");
+        }
+    }
+
+    #[test]
+    fn validates_new_project_folder_names() {
+        for name in ["", ".", "..", "CON", "LPT1", "bad/name", "trailing."] {
+            assert!(validate_project_name(name).is_err(), "accepted {name}");
+        }
+        for name in ["My Game", "Project_02", "árena"] {
+            assert!(validate_project_name(name).is_ok(), "rejected {name}");
         }
     }
 

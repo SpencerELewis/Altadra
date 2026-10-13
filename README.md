@@ -33,8 +33,23 @@ subsystem, so it does not open an extra console window.
 
 ## Editor
 
+- The app opens to **Home**. Name a project and select **Create project** to open
+  an unsaved starter scene; choosing a save location up front is optional. Save
+  from the editor toolbar, or choose **Save** when exiting to choose a location.
+- **Open / import project** selects an existing folder containing `scene.json`
+  and its `assets` folder. This opens projects in place without changing or
+  copying their existing data.
+- The Home page lists up to 12 recently opened projects. Open one directly, remove
+  an entry, or clear the list. Recent projects are stored in your user application
+  data (`%APPDATA%\Altadra\recent-projects.json` on Windows).
+- **Home** in the editor returns to the project picker; unsaved changes require
+  confirmation. Exiting an unsaved project or a project with recent edits asks
+  whether to save, discard, or cancel. Existing projects save to their current
+  folder; new projects use the chosen parent folder and project name.
 - Start with an example scene containing a Lua-controlled player, a moving sprite,
   and a platform. Add, select, and delete sprites in the scene panel.
+- The editor's left dock opens to the **Project** tab, which shows the active
+  project's folder tree. Switch to **Scene** for the sprite hierarchy and controls.
 - Edit name, position, rotation, scale, size, tint, visibility, velocity, and each
   sprite's Lua script in the inspector.
 - Click sprites to select them in the viewport. Rotation and scale are used for
