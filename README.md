@@ -59,7 +59,8 @@ subsystem, so it does not open an extra console window.
   assets can be imported from anywhere. Use the **+** menu or right-click the
   project root, a folder, or a file to create items; a name field appears inline
   in the tree where the item will be added (press **Enter** to create, **Esc** to
-  cancel). Right-click also provides rename and delete actions. Select a file or
+  cancel). Right-click a folder or file to rename it in place the same way, or to
+  delete it; files only offer **New File** (no New Folder). Select a file or
   folder and press **Delete** to
   remove it (with confirmation). Selected sprites have a bright outline in the
   viewport. Switch to **Scene** for the sprite hierarchy and controls.

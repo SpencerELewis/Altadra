@@ -727,6 +727,14 @@ impl Altadra {
         if outcome == InlineOutcome::Cancel || dialog.name.trim().is_empty() {
             return;
         }
+        if dialog.action == project_files::EntryAction::Rename
+            && dialog
+                .target
+                .file_name()
+                .is_some_and(|current| current.to_string_lossy() == dialog.name.trim())
+        {
+            return;
+        }
         self.apply_file_dialog(dialog, ctx);
         if let Some(dialog) = self.file_dialog.as_mut() {
             if outcome == InlineOutcome::CommitOnBlur {
@@ -933,53 +941,6 @@ impl Altadra {
         }
     }
 
-    fn file_dialog_window(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = self
-            .file_dialog
-            .as_mut()
-            .filter(|dialog| dialog.action == project_files::EntryAction::Rename)
-        else {
-            return;
-        };
-        let title = match dialog.action {
-            project_files::EntryAction::NewFile => "New file",
-            project_files::EntryAction::NewFolder => "New folder",
-            project_files::EntryAction::Rename => "Rename",
-        };
-        let mut result = None;
-        let mut cancel = false;
-        let confirm_label = if dialog.action == project_files::EntryAction::Rename {
-            "Rename"
-        } else {
-            "Create"
-        };
-        egui::Window::new(title)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(format!("In: {}", dialog.target.display()));
-                let response = ui.text_edit_singleline(&mut dialog.name);
-                if ui.input(|input| input.key_pressed(egui::Key::Enter)) && response.has_focus() {
-                    result = Some(());
-                }
-                ui.horizontal(|ui| {
-                    if ui.button(confirm_label).clicked() {
-                        result = Some(());
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancel = true;
-                    }
-                });
-            });
-        if let Some(()) = result {
-            if let Some(dialog) = self.file_dialog.take() {
-                self.apply_file_dialog(dialog, ctx);
-            }
-        } else if cancel {
-            self.file_dialog = None;
-        }
-    }
-
     fn file_action(&mut self, action: FileAction, ctx: &egui::Context) {
         if self.runtime.is_some() {
             self.error = Some("Stop play mode before changing the project.".into());
@@ -1146,9 +1107,7 @@ impl Altadra {
                         .clicked()
                     {
                         self.left_panel_tab = LeftPanelTab::Scene;
-                        if inline_create_target(&self.file_dialog).is_some() {
-                            self.file_dialog = None;
-                        }
+                        self.file_dialog = None;
                     }
                 });
                 ui.separator();
@@ -1226,7 +1185,7 @@ impl Altadra {
                                 response_context_menu(
                                     &header_label.inner,
                                     &root,
-                                    true,
+                                    TreeEntryKind::Root,
                                     &mut context_action,
                                 );
                                 let blank_space = ui.allocate_response(
@@ -1239,7 +1198,7 @@ impl Altadra {
                                 response_context_menu(
                                     &blank_space,
                                     &root,
-                                    true,
+                                    TreeEntryKind::Root,
                                     &mut context_action,
                                 );
                             });
@@ -1652,7 +1611,6 @@ impl eframe::App for Altadra {
                 } else {
                     self.viewport(ctx);
                 }
-                self.file_dialog_window(ctx);
                 self.save_project_dialog_window(ctx);
                 egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
                     if let Some(error) = &self.error {
@@ -1726,6 +1684,7 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
         };
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
+        let renaming = inline_rename_target(tree.inline_create) == Some(path.as_path());
         if file_type.is_dir() {
             let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),
@@ -1739,6 +1698,10 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
             }
             let (_, header_label, _) = state
                 .show_header(ui, |ui| {
+                    if renaming && let Some(dialog) = tree.inline_create.as_mut() {
+                        ui.label("📁");
+                        return inline_name_edit(ui, dialog, "Folder name", tree.inline_outcome);
+                    }
                     let response = ui.selectable_label(
                         tree.selected_file.as_ref() == Some(&path),
                         format!("📁 {name}"),
@@ -1749,7 +1712,19 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
                     response
                 })
                 .body(|ui| render_project_tree(ui, &path, tree));
-            response_context_menu(&header_label.inner, &path, false, tree.context_action);
+            if !renaming {
+                response_context_menu(
+                    &header_label.inner,
+                    &path,
+                    TreeEntryKind::Folder,
+                    tree.context_action,
+                );
+            }
+        } else if renaming && let Some(dialog) = tree.inline_create.as_mut() {
+            ui.horizontal(|ui| {
+                ui.label("📄");
+                inline_name_edit(ui, dialog, "File name", tree.inline_outcome);
+            });
         } else {
             let response = ui.selectable_label(
                 tree.selected_file.as_ref() == Some(&path),
@@ -1759,7 +1734,7 @@ fn render_project_tree(ui: &mut egui::Ui, directory: &std::path::Path, tree: &mu
                 *tree.selected_file = Some(path.clone());
                 *tree.clicked_file = Some(path.clone());
             }
-            response_context_menu(&response, &path, false, tree.context_action);
+            response_context_menu(&response, &path, TreeEntryKind::File, tree.context_action);
         }
     }
 }
@@ -1780,10 +1755,24 @@ enum InlineOutcome {
     Cancel,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeEntryKind {
+    Root,
+    Folder,
+    File,
+}
+
 fn inline_create_target(dialog: &Option<FileDialogState>) -> Option<&std::path::Path> {
     dialog
         .as_ref()
         .filter(|dialog| dialog.action != project_files::EntryAction::Rename)
+        .map(|dialog| dialog.target.as_path())
+}
+
+fn inline_rename_target(dialog: &Option<FileDialogState>) -> Option<&std::path::Path> {
+    dialog
+        .as_ref()
+        .filter(|dialog| dialog.action == project_files::EntryAction::Rename)
         .map(|dialog| dialog.target.as_path())
 }
 
@@ -1809,31 +1798,55 @@ fn render_inline_create(
     };
     ui.horizontal(|ui| {
         ui.label(icon);
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut dialog.name)
-                .hint_text(hint)
-                .desired_width(f32::INFINITY),
-        );
-        if !dialog.focused {
-            response.request_focus();
-            dialog.focused = true;
-        }
-        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
-            *tree.inline_outcome = Some(InlineOutcome::Cancel);
-        } else if response.lost_focus() {
-            *tree.inline_outcome = Some(if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                InlineOutcome::Commit
-            } else {
-                InlineOutcome::CommitOnBlur
-            });
-        }
+        inline_name_edit(ui, dialog, hint, tree.inline_outcome);
     });
+}
+
+fn inline_name_edit(
+    ui: &mut egui::Ui,
+    dialog: &mut FileDialogState,
+    hint: &str,
+    outcome: &mut Option<InlineOutcome>,
+) -> egui::Response {
+    let mut output = egui::TextEdit::singleline(&mut dialog.name)
+        .hint_text(hint)
+        .desired_width(f32::INFINITY)
+        .show(ui);
+    if !dialog.focused {
+        output.response.request_focus();
+        // Preselect the name (without its extension) so typing replaces it.
+        let end = match dialog.name.rfind('.') {
+            Some(dot) if dot > 0 && dialog.action == project_files::EntryAction::Rename => {
+                dialog.name[..dot].chars().count()
+            }
+            _ => dialog.name.chars().count(),
+        };
+        output
+            .state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(end),
+            )));
+        output.state.store(ui.ctx(), output.response.id);
+        dialog.focused = true;
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        *outcome = Some(InlineOutcome::Cancel);
+    } else if output.response.lost_focus() {
+        *outcome = Some(if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            InlineOutcome::Commit
+        } else {
+            InlineOutcome::CommitOnBlur
+        });
+    }
+    output.response
 }
 
 fn response_context_menu(
     response: &egui::Response,
     path: &std::path::Path,
-    is_root: bool,
+    kind: TreeEntryKind,
     context_action: &mut Option<(TreeAction, PathBuf)>,
 ) {
     response.context_menu(|ui| {
@@ -1841,11 +1854,11 @@ fn response_context_menu(
             *context_action = Some((TreeAction::NewFile, path.to_path_buf()));
             ui.close_menu();
         }
-        if ui.button("New Folder").clicked() {
+        if kind != TreeEntryKind::File && ui.button("New Folder").clicked() {
             *context_action = Some((TreeAction::NewFolder, path.to_path_buf()));
             ui.close_menu();
         }
-        if !is_root {
+        if kind != TreeEntryKind::Root {
             ui.separator();
             if ui.button("Rename").clicked() {
                 *context_action = Some((TreeAction::Rename, path.to_path_buf()));
