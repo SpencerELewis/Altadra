@@ -37,7 +37,7 @@ cargo build --release --locked
 | `main.rs` | Editor app (`Altadra` implementing `eframe::App`): Home, File menu, explorer, typed document tabs, contextual inspector, placement/play viewport, save dialog. |
 | `documents.rs` | Versioned TOML project/object/level schemas, validation, persistence, reference maintenance, and instance resolution using supplied document/script readers. |
 | `document_editor.rs` | Property editors for project/object/level documents and project-file reference pickers. |
-| `project.rs` | `.altgame` discovery/load/save, dependency-to-runtime resolution, legacy JSON migration, PNG import/validation, project-name validation and symlink rejection. |
+| `project.rs` | `.altgame` discovery/load/save, dependency-to-runtime resolution, legacy JSON migration, image import/validation, project-name validation and symlink rejection. |
 | `project_files.rs` | Sandboxed file-explorer operations: create/rename/delete entries, read/write UTF-8 text (≤ 1 MB, atomic writes), copy workspace files, stage assets. Every path goes through `checked_path`. |
 | `scene.rs` | Resolved `Scene`/`Sprite` runtime representation and validation; not the new authoring file format. |
 | `runtime.rs` | Play mode: fixed 60 Hz step over a cloned scene, sandboxed Lua (no `os`/`io`/`debug`, instruction and memory limits). |
@@ -60,14 +60,17 @@ cargo build --release --locked
   first save, and Save As; remove affected tabs only after successful deletion.
 - Custom documents retain TOML buffers as their source of truth; dedicated editors
   parse those buffers and serialize changes back. Raw-source editing is available
-  for repair. PNG tabs have no text buffer. The resolved `project.scene` is a
+  for repair. Image tabs have no text buffer. The resolved `project.scene` is a
   rendering/runtime cache, not a separate authoring document. Resolve dependencies
   from open buffers before disk so Play includes unsaved changes.
 - Manifest projects have exactly one root `.altgame`. Other custom files use
   version-1 TOML and project-relative references. The Lua contract remains
   `return function(entity, input, dt)`. Migration is opt-in and preserves originals.
-- PNG imports are staged immediately in the project/workspace. Exclude resolved
+- Image imports are staged immediately in the project/workspace. Exclude resolved
   image caches from manifest saves so renamed images aren't recreated at old paths.
+- Imports preserve filenames in the selected explorer folder (selected files use
+  their parent; no selection uses the root), with project-relative references.
+  Reject conflicting existing contents; never reference external source paths.
 - Documents have a `preview` flag: single-click replaces the clean preview tab,
   double-click pins it, and editing pins it automatically. Preview labels are
   italic. Never replace a dirty buffer. The File menu holds project actions;
@@ -101,7 +104,10 @@ cargo build --release --locked
   operations; reject symlinks and paths outside the project root; root
   legacy `scene.json` is protected by file helpers, and the active `.altgame`
   cannot be renamed/deleted through the explorer. Block file operations during Play.
-- The `assets` folder is created only when a PNG is imported/saved — don't
+- Images support PNG, JPEG, WebP, BMP, and GIF. Shared `decode_image` enforces
+  byte/dimension/allocation limits before decoding; animated images use the first
+  frame. Keep import, reference validation, pickers, previews, and rendering aligned.
+- The `assets` folder is created only when an image is imported/saved — don't
   recreate it eagerly. New projects contain no sample sprites or files.
 - Errors are surfaced as `Result<_, String>` and shown in the status bar
   (`self.error`) rather than panicking.

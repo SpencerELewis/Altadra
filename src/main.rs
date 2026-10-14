@@ -704,7 +704,7 @@ impl Altadra {
     fn refresh_textures(&mut self, ctx: &egui::Context) {
         let mut refreshed = std::collections::HashMap::new();
         for (name, bytes) in &self.project.assets {
-            if let Ok(image) = image::load_from_memory_with_format(bytes, image::ImageFormat::Png) {
+            if let Ok(image) = project::decode_image(bytes) {
                 let image = image.to_rgba8();
                 let size = [image.width() as usize, image.height() as usize];
                 let color = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
@@ -833,10 +833,7 @@ impl Altadra {
             self.status = "Save the project before opening its files.".into();
             return;
         };
-        let contents = if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-        {
+        let contents = if documents::is_image_path(&path) {
             Ok(String::new())
         } else {
             project_files::read_text_file(root, &path)
@@ -994,11 +991,14 @@ impl Altadra {
                 let asset_rename = asset_name_for_path(&root, &old_path)
                     .filter(|name| self.project.assets.contains_key(name))
                     .map(|old_name| {
-                        let new_name = format!("assets/{}", dialog.name);
+                        let new_name = old_name.rsplit_once('/').map_or_else(
+                            || dialog.name.clone(),
+                            |(parent, _)| format!("{parent}/{}", dialog.name),
+                        );
                         (old_name, new_name)
                     });
                 if let Some((_, new_name)) = &asset_rename
-                    && let Err(error) = project::validate_asset_name(new_name)
+                    && let Err(error) = documents::validate_image_reference(new_name)
                 {
                     self.error = Some(error);
                     self.file_dialog = Some(dialog);
@@ -1321,20 +1321,10 @@ impl Altadra {
             },
             FileAction::Import => {
                 if let Some(file) = rfd::FileDialog::new()
-                    .add_filter("PNG image", &["png"])
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"])
                     .pick_file()
                 {
-                    match std::fs::read(&file)
-                        .map_err(|e| e.to_string())
-                        .and_then(|bytes| {
-                            let name =
-                                self.project.import_png(&bytes).map_err(|e| e.to_string())?;
-                            let root = self
-                                .file_root_path()
-                                .ok_or_else(|| "No project folder is available.".to_owned())?;
-                            project_files::stage_asset_file(root, &name, &bytes)?;
-                            Ok(name)
-                        }) {
+                    match self.import_image_file(&file) {
                         Ok(name) => {
                             if let Some(index) = self.files.active
                                 && let Ok(documents::Document::Object(mut object)) =
@@ -1343,11 +1333,8 @@ impl Altadra {
                                 object.appearance.image = Some(name.clone());
                                 self.update_document(index, &documents::Document::Object(object));
                             }
-                            if let Some(root) = self.file_root_path() {
-                                self.unsaved_entries.push(root.join(name));
-                            }
                             self.refresh_textures(ctx);
-                            self.status = format!("Imported {}", file.display());
+                            self.status = format!("Imported {name} into the project.");
                             self.error = None;
                         }
                         Err(e) => self.error = Some(e),
@@ -1355,6 +1342,56 @@ impl Altadra {
                 }
             }
         }
+    }
+
+    fn import_image_file(&mut self, source: &std::path::Path) -> Result<String, String> {
+        if self.runtime.is_some() {
+            return Err("Stop play mode before changing project files.".into());
+        }
+        let root = self
+            .file_root_path()
+            .ok_or_else(|| "No project folder is available.".to_owned())?
+            .to_path_buf();
+        let target = self
+            .selected_file
+            .as_deref()
+            .filter(|selected| selected.is_dir())
+            .or_else(|| {
+                self.selected_file
+                    .as_deref()
+                    .and_then(std::path::Path::parent)
+            })
+            .unwrap_or(&root);
+        let target = project_files::checked_path(&root, target, true)?;
+        let target = tree_form_path(&root, target);
+        let filename = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "Image filename must be valid UTF-8.".to_owned())?;
+        let relative = target
+            .join(filename)
+            .strip_prefix(&root)
+            .map_err(|_| "Import destination must be inside the project.".to_owned())?
+            .to_str()
+            .ok_or_else(|| "Import path must be valid UTF-8.".to_owned())?
+            .replace('\\', "/");
+        documents::validate_image_reference(&relative)?;
+        let metadata =
+            std::fs::metadata(source).map_err(|error| format!("Could not read image: {error}"))?;
+        if metadata.len() > project::MAX_PNG_BYTES {
+            return Err("Images are limited to 64 MB.".into());
+        }
+        let bytes =
+            std::fs::read(source).map_err(|error| format!("Could not read image: {error}"))?;
+        project::decode_image(&bytes)?;
+        let destination = root.join(&relative);
+        let existed = destination.exists();
+        project_files::stage_file(&root, &relative, &bytes)?;
+        self.project.import_image(&bytes, &relative)?;
+        if !existed {
+            self.unsaved_entries.push(destination);
+        }
+        Ok(relative)
     }
 
     fn update_play(&mut self, ctx: &egui::Context) {
@@ -1428,7 +1465,7 @@ impl Altadra {
                 if let Some(action) = file_action {
                     self.file_action(action, ctx);
                 }
-                if ui.add_enabled(self.runtime.is_none(), egui::Button::new("Import PNG")).clicked() {
+                if ui.add_enabled(self.runtime.is_none(), egui::Button::new("Import Image")).clicked() {
                     self.file_action(FileAction::Import, ctx);
                 }
                 ui.separator();
@@ -1778,10 +1815,7 @@ impl Altadra {
                     return;
                 }
             }
-            if path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
-            {
+            if documents::is_image_path(&path) {
                 self.image_preview(ui, &path, None, ctx);
                 return;
             }
@@ -1998,12 +2032,8 @@ impl Altadra {
             let image_path = reference
                 .map(|name| root.join(name))
                 .unwrap_or_else(|| path.to_path_buf());
-            let bytes = project_files::read_png(root, &image_path)?;
-            let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
-                .map_err(|error| error.to_string())?;
-            if image.width() > 4096 || image.height() > 4096 {
-                return Err("PNG dimensions are limited to 4096 x 4096.".to_owned());
-            }
+            let bytes = project_files::read_image(root, &image_path)?;
+            let image = project::decode_image(&bytes)?;
             let image = image.to_rgba8();
             let texture = ctx.load_texture(
                 image_path.display().to_string(),
@@ -2611,13 +2641,10 @@ fn tree_form_path(root: &std::path::Path, path: PathBuf) -> PathBuf {
 
 fn asset_name_for_path(root: &std::path::Path, path: &std::path::Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
-    if relative.parent()? != std::path::Path::new("assets") {
+    if !documents::is_image_path(relative) {
         return None;
     }
-    Some(format!(
-        "assets/{}",
-        relative.file_name()?.to_string_lossy()
-    ))
+    Some(relative.to_str()?.replace('\\', "/"))
 }
 
 fn new_project() -> Project {
@@ -2994,6 +3021,61 @@ mod tests {
             last_tick: std::time::Instant::now(),
             viewport_focus_id: None,
         }
+    }
+    #[test]
+    fn imports_copy_original_names_into_selected_project_folders() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("Player.png");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        std::fs::write(&source, bytes.get_ref()).unwrap();
+        let mut app = workspace_app();
+        let root = app.file_root_path().unwrap().to_path_buf();
+        let folder = crate::project_files::create_folder(&root, &root, "Art").unwrap();
+        app.selected_file = Some(super::tree_form_path(&root, folder));
+        assert_eq!(app.import_image_file(&source).unwrap(), "Art/Player.png");
+        assert_eq!(
+            std::fs::read(root.join("Art\\Player.png")).unwrap(),
+            *bytes.get_ref()
+        );
+        assert!(app.unsaved_entries.contains(&root.join("Art\\Player.png")));
+        assert!(!root.join("assets").exists());
+        app.selected_file = Some(root.join("Art\\Player.png"));
+        assert_eq!(app.import_image_file(&source).unwrap(), "Art/Player.png");
+        assert_eq!(app.unsaved_entries.len(), 1);
+        std::fs::remove_file(&source).unwrap();
+        assert!(crate::project_files::read_image(&root, &root.join("Art\\Player.png")).is_ok());
+        std::fs::write(&source, bytes.get_ref()).unwrap();
+        crate::project_files::stage_file(&root, "Player.png", b"existing").unwrap();
+        app.selected_file = None;
+        assert!(
+            app.import_image_file(&source)
+                .unwrap_err()
+                .contains("different contents")
+        );
+        assert_eq!(std::fs::read(root.join("Player.png")).unwrap(), b"existing");
+        std::fs::remove_file(root.join("Player.png")).unwrap();
+        assert_eq!(app.import_image_file(&source).unwrap(), "Player.png");
+        app.selected_file = Some(source_dir.path().to_path_buf());
+        assert!(app.import_image_file(&source).is_err());
+        std::fs::remove_file(&source).unwrap();
+        let saved = tempfile::tempdir().unwrap();
+        let saved_root = saved.path().join("Game");
+        app.save_project_snapshot(saved_root.clone()).unwrap();
+        assert_eq!(
+            std::fs::read(saved_root.join("Art\\Player.png")).unwrap(),
+            *bytes.get_ref()
+        );
+        assert!(app.unsaved_entries.is_empty());
+        let copy = tempfile::tempdir().unwrap();
+        let copy_root = copy.path().join("Game Copy");
+        app.save_project_snapshot(copy_root.clone()).unwrap();
+        assert_eq!(
+            std::fs::read(copy_root.join("Art\\Player.png")).unwrap(),
+            *bytes.get_ref()
+        );
     }
 
     fn create_document(app: &mut super::Altadra, name: &str, kind: &'static str) {

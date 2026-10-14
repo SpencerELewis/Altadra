@@ -7,7 +7,7 @@ description = "A small Rust 2D game engine with a Lua-scriptable Windows scene e
 [dependencies]
 eframe = "0.31"
 egui = "0.31"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "gif"] }
 mlua = { version = "0.10", features = ["lua54", "vendored"] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }

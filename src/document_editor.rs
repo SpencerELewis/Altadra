@@ -38,10 +38,13 @@ pub fn reference_picker(
         .selected_text(value.as_deref().unwrap_or("None"))
         .show_ui(ui, |ui| {
             ui.selectable_value(value, None, "None");
-            for entry in entries
-                .iter()
-                .filter(|path| path.to_ascii_lowercase().ends_with(extension))
-            {
+            for entry in entries.iter().filter(|path| {
+                if extension == "image" {
+                    crate::documents::is_image_path(Path::new(path))
+                } else {
+                    path.to_ascii_lowercase().ends_with(extension)
+                }
+            }) {
                 ui.selectable_value(value, Some(entry.clone()), entry);
             }
         });
@@ -73,7 +76,8 @@ pub fn properties(
             ui.heading("Object");
             changed |= ui.text_edit_singleline(&mut object.name).changed();
             ui.label("Image");
-            changed |= reference_picker(ui, "Image", &mut object.appearance.image, entries, ".png");
+            changed |=
+                reference_picker(ui, "Image", &mut object.appearance.image, entries, "image");
             ui.label("Lua behavior");
             changed |=
                 reference_picker(ui, "Behavior", &mut object.behavior.script, entries, ".lua");

@@ -85,7 +85,7 @@ subsystem, so it does not open an extra console window.
 - Single-clicking a file opens an italic preview tab; opening another preview
   replaces it. Double-click a file or its tab to keep it open. Editing a preview
   also keeps it open automatically; unsaved edits are never replaced.
-- Object tabs edit reusable appearance and velocity defaults, PNG references, and
+- Object tabs edit reusable appearance and velocity defaults, image references, and
   external Lua behavior references in Properties. Level tabs show a placement
   canvas and an instance list in Properties. Add objects using the object picker
   or drag `.altobject` files from the explorer onto the canvas. Select and drag
@@ -93,14 +93,22 @@ subsystem, so it does not open an extra console window.
   deletion, optional overrides, and resetting overrides to object defaults.
   Press **Delete** with an instance selected and the level canvas focused to remove
   that instance only, not its object file. The level is marked unsaved.
-- Project tabs select the starting level. PNG tabs preview artwork. Invalid custom
+- Project tabs select the starting level. Image tabs preview artwork. Invalid custom
   documents show an error; **Edit TOML source** allows inspection and repair.
 - Renaming project files updates referencing documents and marks them unsaved;
   deleting referenced items warns which documents will have broken references.
 - Click sprites to select them in the viewport. Rotation and scale are used for
   rendering and rectangle picking. The scene origin is centered; +X is right,
   +Y is down; the last sprite draws on top.
-- Import PNG files to copy artwork into the project. If an object tab is active,
+- **Import Image** accepts PNG, JPEG (`.jpg`/`.jpeg`), WebP, BMP, and GIF files.
+  Images are copied into the selected explorer folder with their original filename
+  and format (a selected file uses its containing folder; no selection uses the
+  project root). References point to the project copy, never the original location,
+  so moving or deleting the source image does not break the project. Existing files
+  with different contents are not overwritten. GIF and animated
+  WebP artwork use only the first frame; animation playback is not supported yet.
+  The same formats work in image previews and object image selectors.
+  If an object tab is active,
   the imported image is assigned to it. Objects without an image render as
   solid-color rectangles.
 - **File** in the top bar contains **New**, **Open**, **Save**, and **Save As**,
@@ -151,8 +159,8 @@ MyGame\
   Player.altobject
   Player.lua
   Level1.altscene
-  assets\          (created only when PNG images are imported)
-    <sha256>.png
+  assets\          (created only when images are imported)
+    Player.png
 ```
 
 `.altgame` stores the project name and optional `starting_level`. `.altobject`
@@ -181,7 +189,7 @@ vy = 0
 ```
 
 TOML/text files are limited to 1 MB, Lua behaviors to 64 KB, instances to 10,000
-per level, PNG files to 64 MB, and image dimensions to 4096 x 4096. Unknown fields
+per level, image files to 64 MB, and image dimensions to 4096 x 4096. Unknown fields
 and unsupported versions are rejected. Path traversal and symlinks are rejected;
 text saves are atomic. Legacy migration keeps the old JSON and asset files.
 

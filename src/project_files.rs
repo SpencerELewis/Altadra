@@ -203,6 +203,18 @@ pub fn read_png(root: &Path, file: &Path) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+pub fn read_image(root: &Path, file: &Path) -> Result<Vec<u8>, String> {
+    if file
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+    {
+        return read_png(root, file);
+    }
+    let bytes = read_binary_file(root, file, crate::project::MAX_PNG_BYTES)?;
+    crate::project::decode_image(&bytes)?;
+    Ok(bytes)
+}
+
 /// Writes binary `contents` at a `/`-separated project-relative path, creating
 /// missing folders. An existing identical file is left alone; a different one
 /// is an error.
@@ -246,6 +258,7 @@ pub fn stage_file(root: &Path, relative: &str, contents: &[u8]) -> Result<PathBu
     Ok(file)
 }
 
+#[cfg(test)]
 pub fn stage_asset_file(root: &Path, asset_name: &str, contents: &[u8]) -> Result<(), String> {
     crate::project::validate_asset_name(asset_name)?;
     let parent = root.join("assets");
@@ -374,7 +387,11 @@ fn ensure_managed_scene_is_unchanged(root: &Path, entry: &Path) -> Result<(), St
     Ok(())
 }
 
-fn checked_path(root: &Path, target: &Path, allow_root: bool) -> Result<PathBuf, String> {
+pub(crate) fn checked_path(
+    root: &Path,
+    target: &Path,
+    allow_root: bool,
+) -> Result<PathBuf, String> {
     let canonical_root = root
         .canonicalize()
         .map_err(|error| format!("Could not resolve project folder: {error}"))?;

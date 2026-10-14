@@ -126,7 +126,27 @@ fn validate_reference(reference: &str, extension: &str) -> Result<(), String> {
 }
 
 pub fn validate_image_reference(reference: &str) -> Result<(), String> {
-    validate_reference(reference, ".png")
+    if !is_image_path(Path::new(reference)) {
+        return Err(format!(
+            "Unsupported image reference '{reference}'. Use PNG, JPEG, WebP, BMP, or GIF."
+        ));
+    }
+    let extension = Path::new(reference)
+        .extension()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "Image reference has no extension.".to_owned())?;
+    validate_reference(reference, &format!(".{}", extension.to_ascii_lowercase()))
+}
+
+pub fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif"
+            )
+        })
 }
 
 impl ObjectDocument {
@@ -155,7 +175,7 @@ impl ObjectDocument {
     fn validate(&self) -> Result<(), String> {
         validate_header(self.version, &self.name)?;
         if let Some(image) = &self.appearance.image {
-            validate_reference(image, ".png")?;
+            validate_image_reference(image)?;
         }
         if let Some(script) = &self.behavior.script {
             validate_reference(script, ".lua")?;
@@ -387,6 +407,25 @@ pub fn resolve_level(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_references_accept_supported_formats_and_reject_unsafe_paths() {
+        for extension in ["PNG", "JPG", "JPEG", "WEBP", "BMP", "GIF"] {
+            let reference = format!("art/Player.{extension}");
+            assert!(is_image_path(Path::new(&reference)));
+            assert!(validate_image_reference(&reference).is_ok());
+        }
+        for reference in [
+            "../Player.jpg",
+            "/Player.gif",
+            "C:/Player.bmp",
+            "art\\Player.webp",
+            "art/Player.svg",
+            "art/Player.tiff",
+        ] {
+            assert!(validate_image_reference(reference).is_err(), "{reference}");
+        }
+    }
 
     #[test]
     fn all_document_types_round_trip() {

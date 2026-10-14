@@ -5,6 +5,7 @@ use crate::documents::{
 use crate::project_files;
 use crate::scene::Scene;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -119,10 +120,51 @@ pub fn validate_png(bytes: &[u8]) -> Result<(), String> {
     if image.width() > 4096 || image.height() > 4096 {
         return Err("PNG dimensions are limited to 4096 × 4096.".into());
     }
+
     Ok(())
 }
 
+pub fn decode_image(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    if bytes.len() as u64 > MAX_PNG_BYTES {
+        return Err("Images are limited to 64 MB.".into());
+    }
+    let format = image::guess_format(bytes).map_err(|error| format!("Invalid image: {error}"))?;
+    if !matches!(
+        format,
+        image::ImageFormat::Png
+            | image::ImageFormat::Jpeg
+            | image::ImageFormat::WebP
+            | image::ImageFormat::Bmp
+            | image::ImageFormat::Gif
+    ) {
+        return Err("Supported images are PNG, JPEG, WebP, BMP, and GIF.".into());
+    }
+    let reader = || image::ImageReader::with_format(std::io::Cursor::new(bytes), format);
+    let (width, height) = reader()
+        .into_dimensions()
+        .map_err(|error| format!("Could not read image dimensions: {error}"))?;
+    if width == 0 || height == 0 || width > 4096 || height > 4096 {
+        return Err("Image dimensions are limited to 1-4096 pixels.".into());
+    }
+    let mut reader = reader();
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|error| format!("Could not decode image: {error}"))
+}
+
 impl Project {
+    pub fn import_image(&mut self, bytes: &[u8], name: &str) -> Result<String, String> {
+        documents::validate_image_reference(name)?;
+        decode_image(bytes)?;
+        self.assets.insert(name.to_owned(), bytes.to_vec());
+        Ok(name.to_owned())
+    }
+    #[cfg(test)]
     pub fn import_png(&mut self, bytes: &[u8]) -> Result<String, String> {
         validate_png(bytes)?;
         let digest = Sha256::digest(bytes);
@@ -290,8 +332,9 @@ impl Project {
             if let Some(image) = &sprite.asset
                 && !assets.contains_key(image)
             {
-                let bytes = project_files::read_png(root, &documents::reference_path(root, image))
-                    .map_err(|e| format!("Image '{image}': {e}"))?;
+                let bytes =
+                    project_files::read_image(root, &documents::reference_path(root, image))
+                        .map_err(|e| format!("Image '{image}': {e}"))?;
                 assets.insert(image.clone(), bytes);
             }
         }
@@ -357,7 +400,7 @@ impl Project {
         assets.sort_by(|left, right| left.0.cmp(right.0));
         for (name, bytes) in &assets {
             documents::validate_image_reference(name)?;
-            validate_png(bytes).map_err(|e| format!("Image '{name}': {e}"))?;
+            decode_image(bytes).map_err(|e| format!("Image '{name}': {e}"))?;
         }
         let root = Self::prepare_root(directory)?;
         if let Some(existing) = Self::find_manifest(&root)?
@@ -688,6 +731,99 @@ fn reject_symlink(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn additional_images_import_resolve_save_and_reopen() {
+        for (format, extension) in [
+            (image::ImageFormat::Jpeg, "jpg"),
+            (image::ImageFormat::WebP, "webp"),
+            (image::ImageFormat::Bmp, "bmp"),
+            (image::ImageFormat::Gif, "gif"),
+        ] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                2,
+                2,
+                image::Rgb([50, 100, 150]),
+            ))
+            .write_to(&mut bytes, format)
+            .unwrap();
+            let bytes = bytes.into_inner();
+            let mut project = Project::default();
+            let reference = project
+                .import_image(&bytes, &format!("Art/Player.{extension}"))
+                .unwrap();
+            assert_eq!(project.import_image(&bytes, &reference).unwrap(), reference);
+            assert_eq!(project.assets.len(), 1);
+            assert!(reference.ends_with(extension));
+            assert_eq!(decode_image(&bytes).unwrap().width(), 2);
+            let root = tempfile::tempdir().unwrap();
+            project.save(root.path()).unwrap();
+            let mut object = crate::documents::ObjectDocument::new("Artwork");
+            object.appearance.image = Some(reference.clone());
+            let object_path =
+                crate::project_files::create_file(root.path(), root.path(), "Art.altobject")
+                    .unwrap();
+            crate::documents::save(root.path(), &object_path, &Document::Object(object)).unwrap();
+            let level = LevelDocument {
+                version: 1,
+                name: "Level".into(),
+                instances: vec![crate::documents::Instance {
+                    id: "art".into(),
+                    object: "Art.altobject".into(),
+                    x: 0.0,
+                    y: 0.0,
+                    rotation: 0.0,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    overrides: Default::default(),
+                }],
+            };
+            let level_path =
+                crate::project_files::create_file(root.path(), root.path(), "Level.altscene")
+                    .unwrap();
+            crate::documents::save(root.path(), &level_path, &Document::Level(level)).unwrap();
+            project.manifest.starting_level = Some("Level.altscene".into());
+            project.save(root.path()).unwrap();
+            let loaded = Project::load(root.path()).unwrap();
+            assert!(loaded.load_warning.is_none(), "{:?}", loaded.load_warning);
+            assert_eq!(
+                loaded.scene.sprites[0].asset.as_deref(),
+                Some(reference.as_str())
+            );
+            assert_eq!(loaded.assets[&reference], bytes);
+        }
+    }
+
+    #[test]
+    fn animated_gif_uses_only_first_frame() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                        1,
+                        1,
+                        image::Rgba(color),
+                    )))
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            decode_image(&bytes).unwrap().to_rgba8().get_pixel(0, 0).0,
+            [255, 0, 0, 255]
+        );
+        assert!(decode_image(b"invalid image").is_err());
+        let mut huge = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(4097, 1))
+            .write_to(
+                &mut std::io::Cursor::new(&mut huge),
+                image::ImageFormat::Bmp,
+            )
+            .unwrap();
+        assert!(decode_image(&huge).unwrap_err().contains("dimensions"));
+    }
     use crate::scene::Sprite;
 
     fn png(width: u32) -> Vec<u8> {
