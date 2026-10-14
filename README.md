@@ -91,6 +91,8 @@ subsystem, so it does not open an extra console window.
   or drag `.altobject` files from the explorer onto the canvas. Select and drag
   instances to move them; Properties also supports transforms, duplication,
   deletion, optional overrides, and resetting overrides to object defaults.
+  Press **Delete** with an instance selected and the level canvas focused to remove
+  that instance only, not its object file. The level is marked unsaved.
 - Project tabs select the starting level. PNG tabs preview artwork. Invalid custom
   documents show an error; **Edit TOML source** allows inspection and repair.
 - Renaming project files updates referencing documents and marks them unsaved;

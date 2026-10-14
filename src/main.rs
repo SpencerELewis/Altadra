@@ -172,7 +172,7 @@ struct Altadra {
     status: String,
     error: Option<String>,
     last_tick: Instant,
-    viewport_focused: bool,
+    viewport_focus_id: Option<egui::Id>,
 }
 
 impl Altadra {
@@ -209,7 +209,7 @@ impl Altadra {
             status: "Choose a project to get started.".into(),
             error: None,
             last_tick: Instant::now(),
-            viewport_focused: false,
+            viewport_focus_id: None,
         };
         app.refresh_textures(&cc.egui_ctx);
         app
@@ -1222,6 +1222,63 @@ impl Altadra {
         }
     }
 
+    fn handle_instance_delete_key(&mut self, ctx: &egui::Context) {
+        if self.page != AppPage::Editor
+            || self.runtime.is_some()
+            || self.file_dialog.is_some()
+            || self.save_dialog.is_some()
+            || !self
+                .viewport_focus_id
+                .is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
+        {
+            return;
+        }
+        let Some(index) = self.files.active else {
+            return;
+        };
+        let file = &self.files.documents[index];
+        if file.raw
+            || !file
+                .path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("altscene"))
+        {
+            return;
+        }
+        if !ctx.input_mut(|input| {
+            input.focused && input.consume_key(egui::Modifiers::NONE, egui::Key::Delete)
+        }) {
+            return;
+        }
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        match self.read_document(&self.files.documents[index].path) {
+            Ok(documents::Document::Level(mut level)) => {
+                let Some(instance) = level
+                    .instances
+                    .iter()
+                    .position(|instance| instance.id == selected)
+                else {
+                    return;
+                };
+                level.instances.remove(instance);
+                self.update_document(index, &documents::Document::Level(level));
+                if self.error.is_none() {
+                    self.project
+                        .scene
+                        .sprites
+                        .retain(|sprite| sprite.id != selected);
+                    self.selected = None;
+                    self.status =
+                        "Removed instance from level. The object file is unchanged.".into();
+                }
+            }
+            Err(error) => self.error = Some(error),
+            Ok(_) => {}
+        }
+    }
+
     fn handle_tree_action(&mut self, action: TreeAction, path: PathBuf) {
         self.selected_file = Some(path);
         match action {
@@ -1304,20 +1361,8 @@ impl Altadra {
         let now = Instant::now();
         let dt = now.duration_since(self.last_tick).as_secs_f64().min(0.1);
         self.last_tick = now;
+        let input = play_input(ctx, self.viewport_focus_id);
         let runtime_error = if let Some(runtime) = &mut self.runtime {
-            let input = if self.viewport_focused && !ctx.wants_keyboard_input() {
-                runtime::Input {
-                    left: ctx
-                        .input(|i| i.key_down(egui::Key::A) || i.key_down(egui::Key::ArrowLeft)),
-                    right: ctx
-                        .input(|i| i.key_down(egui::Key::D) || i.key_down(egui::Key::ArrowRight)),
-                    up: ctx.input(|i| i.key_down(egui::Key::W) || i.key_down(egui::Key::ArrowUp)),
-                    down: ctx
-                        .input(|i| i.key_down(egui::Key::S) || i.key_down(egui::Key::ArrowDown)),
-                }
-            } else {
-                runtime::Input::default()
-            };
             runtime.advance(dt, input).err()
         } else {
             None
@@ -2002,10 +2047,10 @@ impl Altadra {
         ui.label("Viewport · origin at center · +X right · +Y down");
         let available = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(available, Sense::click_and_drag());
-        if response.clicked() && self.runtime.is_some() {
+        if response.clicked() || response.drag_started() {
             response.request_focus();
         }
-        self.viewport_focused = response.has_focus();
+        self.viewport_focus_id = Some(response.id);
         let scene = if let Some(runtime) = &self.runtime {
             &runtime.scene
         } else {
@@ -2181,9 +2226,28 @@ fn rotated_corners(center: Pos2, size: Vec2, angle: f32) -> [Pos2; 4] {
     .map(|(x, y)| Pos2::new(center.x + x * cos - y * sin, center.y + x * sin + y * cos))
 }
 
+fn play_input(ctx: &egui::Context, viewport: Option<egui::Id>) -> runtime::Input {
+    if !viewport.is_some_and(|id| ctx.memory(|memory| memory.has_focus(id))) {
+        return runtime::Input::default();
+    }
+    ctx.input(|input| {
+        if !input.focused || input.modifiers.ctrl || input.modifiers.command || input.modifiers.alt
+        {
+            return runtime::Input::default();
+        }
+        runtime::Input {
+            left: input.key_down(egui::Key::A) || input.key_down(egui::Key::ArrowLeft),
+            right: input.key_down(egui::Key::D) || input.key_down(egui::Key::ArrowRight),
+            up: input.key_down(egui::Key::W) || input.key_down(egui::Key::ArrowUp),
+            down: input.key_down(egui::Key::S) || input.key_down(egui::Key::ArrowDown),
+        }
+    })
+}
+
 impl eframe::App for Altadra {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_close_request(ctx);
+        self.handle_instance_delete_key(ctx);
         self.handle_project_delete_key(ctx);
         if self.page == AppPage::Editor
             && self.save_dialog.is_none()
@@ -2612,6 +2676,212 @@ mod tests {
     use super::{EditorFiles, new_project, project_directory_in, tree_form_path};
 
     #[test]
+    fn delete_in_level_canvas_removes_only_selected_instance() {
+        use crate::documents::{Document, Instance, Overrides};
+        let mut app = workspace_app();
+        create_document(&mut app, "Player", "altobject");
+        create_document(&mut app, "Level", "altscene");
+        let root = app.file_root_path().unwrap().to_path_buf();
+        let object_before = std::fs::read(root.join("Player.altobject")).unwrap();
+        let level_path = root.join("Level.altscene");
+        let Document::Level(mut level) = app.read_document(&level_path).unwrap() else {
+            panic!("Expected level");
+        };
+        for id in ["first", "second"] {
+            level.instances.push(Instance {
+                id: id.into(),
+                object: "Player.altobject".into(),
+                x: 0.0,
+                y: 0.0,
+                rotation: 0.0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+                overrides: Overrides::default(),
+            });
+        }
+        app.update_document(1, &Document::Level(level));
+        app.files.save_all(&root).unwrap();
+        let level_before = std::fs::read(&level_path).unwrap();
+        let ctx = egui::Context::default();
+        app.resolve_level(
+            &match app.read_document(&level_path).unwrap() {
+                Document::Level(level) => level,
+                _ => unreachable!(),
+            },
+            &ctx,
+        )
+        .unwrap();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.viewport(ctx));
+        let pos = egui::pos2(100.0, 100.0);
+        for pressed in [true, false] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.viewport(ctx),
+            );
+        }
+        assert!(ctx.memory(|memory| memory.has_focus(app.viewport_focus_id.unwrap())));
+        app.selected = Some("first".into());
+        let delete = || egui::Event::Key {
+            key: egui::Key::Delete,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![delete()],
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_instance_delete_key(ctx);
+                assert!(!ctx.input(|input| input.key_pressed(egui::Key::Delete)));
+                app.viewport(ctx);
+            },
+        );
+        let Document::Level(level) = app.read_document(&level_path).unwrap() else {
+            panic!("Expected level");
+        };
+        assert_eq!(level.instances.len(), 1);
+        assert_eq!(level.instances[0].id, "second");
+        assert!(app.files.documents[1].dirty);
+        assert!(!app.files.documents[1].preview);
+        assert!(app.selected.is_none());
+        assert_eq!(std::fs::read(&level_path).unwrap(), level_before);
+        assert_eq!(
+            std::fs::read(root.join("Player.altobject")).unwrap(),
+            object_before
+        );
+
+        app.selected = Some("second".into());
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![delete()],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("text-editor")));
+                app.handle_instance_delete_key(ctx);
+            },
+        );
+        assert!(
+            app.selected.is_some(),
+            "Text editing must not delete instances"
+        );
+        app.runtime = Some(crate::runtime::Runtime::start(&app.project.scene).unwrap());
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![delete()],
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.memory_mut(|memory| memory.request_focus(app.viewport_focus_id.unwrap()));
+                app.handle_instance_delete_key(ctx);
+            },
+        );
+        assert!(
+            app.selected.is_some(),
+            "Play must not change the authoring level"
+        );
+    }
+
+    #[test]
+    fn focused_play_viewport_delivers_movement_without_leaking_other_focus() {
+        let mut app = workspace_app();
+        let mut sprite = crate::scene::Sprite::new("Player");
+        sprite.script = r"return function(entity, input, dt)
+            local speed = 180
+            entity.x = entity.x + input.x * speed * dt
+            entity.y = entity.y + input.y * speed * dt
+        end"
+        .into();
+        app.project.scene.sprites.push(sprite);
+        app.runtime = Some(crate::runtime::Runtime::start(&app.project.scene).unwrap());
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(100.0, 100.0);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| app.viewport(ctx));
+        for pressed in [true, false] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.viewport(ctx),
+            );
+        }
+        assert!(ctx.memory(|memory| memory.has_focus(app.viewport_focus_id.unwrap())));
+        assert!(
+            ctx.wants_keyboard_input(),
+            "This used to block the focused viewport"
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::D,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                let input = super::play_input(ctx, app.viewport_focus_id);
+                assert!(input.right);
+                app.runtime
+                    .as_mut()
+                    .unwrap()
+                    .advance(1.0 / 60.0, input)
+                    .unwrap();
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("other-editor")));
+                assert!(!super::play_input(ctx, app.viewport_focus_id).right);
+                app.viewport(ctx);
+            },
+        );
+        assert_eq!(app.runtime.as_ref().unwrap().scene.sprites[0].x, 3.0);
+        assert_eq!(app.project.scene.sprites[0].x, 0.0);
+        let _ = ctx.run(
+            egui::RawInput {
+                focused: false,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.memory_mut(|memory| memory.request_focus(app.viewport_focus_id.unwrap()));
+                assert!(!super::play_input(ctx, app.viewport_focus_id).right);
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers: egui::Modifiers::CTRL,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.memory_mut(|memory| memory.request_focus(app.viewport_focus_id.unwrap()));
+                assert!(!super::play_input(ctx, app.viewport_focus_id).right);
+            },
+        );
+    }
+
+    #[test]
     fn explorer_rows_distinguish_click_double_click_and_object_drag() {
         fn frame(
             ctx: &egui::Context,
@@ -2722,7 +2992,7 @@ mod tests {
             status: String::new(),
             error: None,
             last_tick: std::time::Instant::now(),
-            viewport_focused: false,
+            viewport_focus_id: None,
         }
     }
 

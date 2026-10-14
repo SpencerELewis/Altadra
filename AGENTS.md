@@ -105,6 +105,10 @@ cargo build --release --locked
   recreate it eagerly. New projects contain no sample sprites or files.
 - Errors are surfaced as `Result<_, String>` and shown in the status bar
   (`self.error`) rather than panicking.
+- Play input checks the viewport's specific focus ID and native window focus.
+  Do not gate it with `!ctx.wants_keyboard_input()`: that returns false when
+  the viewport itself has focus and blocks all movement. Modifier shortcuts
+  must not be interpreted as movement.
 
 ## Working with the owner
 
